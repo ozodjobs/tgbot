@@ -137,6 +137,14 @@ class SubAdminStates(StatesGroup):
     waiting_user_id = State()
     choosing_perms  = State()
 
+# NEW: Support FSM
+class SupportStates(StatesGroup):
+    waiting_message = State()
+
+# NEW: Admin reply-to-support FSM
+class SupportReplyStates(StatesGroup):
+    waiting_reply = State()
+
 # ================= DB =================
 def get_db():
     return pymysql.connect(
@@ -231,7 +239,7 @@ menu_basic = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📄 PDF yaratish")],
         [KeyboardButton(text="💳 To'lov qilish"), KeyboardButton(text="✅ To'lov qildim")],
-        [KeyboardButton(text="ℹ️ Ma'lumot")]
+        [KeyboardButton(text="ℹ️ Ma'lumot"),       KeyboardButton(text="🆘 Yordam")]
     ],
     resize_keyboard=True
 )
@@ -242,14 +250,12 @@ menu_premium = ReplyKeyboardMarkup(
         [KeyboardButton(text="📝 Referat yozdirish")],
         [KeyboardButton(text="📘 Mustaqil ish yozdirish")],
         [KeyboardButton(text="📋 Buyurtmalarim")],
-        [KeyboardButton(text="ℹ️ Ma'lumot")]
+        [KeyboardButton(text="ℹ️ Ma'lumot"),       KeyboardButton(text="🆘 Yordam")]
     ],
     resize_keyboard=True
 )
 
 def menu_pdf_collecting(count: int, pdf_mode: str) -> ReplyKeyboardMarkup:
-    # CHANGED: Removed the image-count display button and mode-toggle button.
-    # Only keep the action buttons to keep the UI clean.
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📥 PDF yaratish")],
@@ -284,6 +290,10 @@ def admin_panel_kb(uid: int) -> InlineKeyboardMarkup:
         row3.append(InlineKeyboardButton(text="🚫 Premium bekor", callback_data="adm:revoke"))
     if row3:
         rows.append(row3)
+
+    # NEW: Pending payments list button
+    if has_perm(uid, "payments"):
+        rows.append([InlineKeyboardButton(text="⏳ Kutilayotgan to'lovlar", callback_data="adm:pending_payments")])
 
     if has_perm(uid, "listusers"):
         rows.append([InlineKeyboardButton(text="📊 Userlar ro'yxati (Excel)", callback_data="adm:listusers")])
@@ -510,51 +520,44 @@ def build_admin_text(stats: dict, uid: int) -> str:
     base += f"\n📅 {datetime.now().strftime('%d.%m.%Y %H:%M')}"
     return base
 
+# ─── NEW: 24-hour payment check limit ───────────────────────────
+def user_submitted_check_today(uid: int) -> bool:
+    """Returns True if user already submitted a payment check in the last 24 hours."""
+    try:
+        db = get_db()
+        try:
+            with db.cursor() as c:
+                since = datetime.now() - timedelta(hours=24)
+                c.execute(
+                    "SELECT COUNT(*) AS c FROM payments WHERE user_id=%s AND created_at >= %s",
+                    (uid, since)
+                )
+                return c.fetchone()["c"] > 0
+        finally:
+            db.close()
+    except Exception as e:
+        print(f"[user_submitted_check_today ERROR] {e}")
+        return False
+
 # ================================================================
 # ═════════  SCAN PROCESSING — Adaptive (CamScanner style)  ══════
 # ================================================================
 def process_scan_image(img: Image.Image) -> Image.Image:
-    """
-    Advanced adaptive-threshold scan processing.
-
-    Key improvements over a simple global threshold:
-    • Uses a large Gaussian blur as the "local background estimator" — this
-      means shadowed or unevenly lit areas are compared to their *own* local
-      brightness, not a single global cutoff.  Dark corners that are still
-      lighter than the text get turned white; text stays black.
-    • Pixels darker than (local_background − offset) → pure black (ink/text).
-    • Everything else → pure white (paper/background).
-    • A final hard threshold and unsharp-mask pass makes thin text bolder and
-      removes any remaining gray fringing.
-    """
-    # 1. Grayscale + sharpness boost to crisp up text edges
     img = img.convert("L")
     img = ImageEnhance.Sharpness(img).enhance(3.0)
-
-    # 2. Compute local background via large Gaussian blur
     h, w = img.size[1], img.size[0]
     blur_radius = max(30, min(h, w) // 15)
     bg_img = img.filter(ImageFilter.GaussianBlur(radius=blur_radius))
-
     arr = np.array(img, dtype=np.float32)
     bg  = np.array(bg_img, dtype=np.float32)
-
-    # 3. Adaptive binarization:
-    #    pixel is "ink" if it is >offset brightness units darker than local bg
-    offset = 15          # lower = more aggressive; raise if thin text disappears
+    offset = 15
     binary = np.where(arr < (bg - offset), 0, 255).astype(np.uint8)
-
-    # 4. Hard threshold to eliminate gray artifacts
     result_img = Image.fromarray(binary, mode="L")
     result_img = result_img.point(lambda x: 0 if x < 128 else 255)
-
-    # 5. Unsharp mask → make text slightly bolder, then threshold again
     result_img = result_img.filter(
         ImageFilter.UnsharpMask(radius=1, percent=150, threshold=3)
     )
     result_img = result_img.point(lambda x: 0 if x < 180 else 255)
-
-    # 6. Return as RGB (white paper, pure black text)
     out = Image.new("RGB", result_img.size, (255, 255, 255))
     out.paste(result_img)
     return out
@@ -563,39 +566,23 @@ def process_scan_image(img: Image.Image) -> Image.Image:
 # ═════════  PDF BUILDER — Uniform A4 pages via ReportLab  ═══════
 # ================================================================
 def build_pdf_with_reportlab(pil_images: list, pdf_path: str):
-    """
-    Creates a professional PDF where every page is exactly A4 (210×297 mm).
-    Each image is proportionally scaled to fill the printable area and
-    centered on a crisp white page.  No distortion, no black bars.
-    """
-    PAGE_W, PAGE_H = A4      # 595.27 × 841.89 pt  (~72 pt = 1 inch)
-    MARGIN = 28              # ~1 cm margin on every side
-
+    PAGE_W, PAGE_H = A4
+    MARGIN = 28
     usable_w = PAGE_W - 2 * MARGIN
     usable_h = PAGE_H - 2 * MARGIN
-
     c = rl_canvas.Canvas(pdf_path, pagesize=A4)
-
     for pil_img in pil_images:
         img_w, img_h = pil_img.size
-
-        # Scale to fit within usable area while preserving aspect ratio
         scale  = min(usable_w / img_w, usable_h / img_h)
         draw_w = img_w * scale
         draw_h = img_h * scale
-
-        # Center on the page
         x = MARGIN + (usable_w - draw_w) / 2
         y = MARGIN + (usable_h - draw_h) / 2
-
-        # Write image into an in-memory buffer for ReportLab
         buf = io.BytesIO()
         pil_img.save(buf, format="JPEG", quality=92, optimize=True)
         buf.seek(0)
-
         c.drawImage(ImageReader(buf), x, y, width=draw_w, height=draw_h)
         c.showPage()
-
     c.save()
 
 # ================= EXCEL BUILDER =================
@@ -657,6 +644,79 @@ def build_users_excel(rows: list) -> bytes:
 @dp.message(F.text == "ℹ️ Ma'lumot")
 async def info_handler(message: types.Message):
     await message.answer(BOT_INFO_TEXT, parse_mode="HTML")
+
+# ================================================================
+# ══════════════  SUPPORT / YORDAM  (NEW)  ═══════════════════════
+# ================================================================
+
+@dp.message(F.text == "🆘 Yordam")
+async def support_start(message: types.Message, state: FSMContext):
+    """User presses Support — ask them to write their message."""
+    await state.set_state(SupportStates.waiting_message)
+    await message.answer(
+        "✍️ Xabaringizni yozing:",
+        reply_markup=kb_cancel()
+    )
+
+@dp.message(SupportStates.waiting_message, F.text)
+async def support_receive(message: types.Message, state: FSMContext):
+    """Forward user message to admin and confirm to user."""
+    uid      = message.from_user.id
+    username = message.from_user.username or "—"
+    text     = message.text.strip()
+    await state.clear()
+
+    # Build caption for admin
+    admin_txt = (
+        f"💬 <b>YORDAM SO'ROVI</b>\n"
+        f"👤 @{username} (ID: <code>{uid}</code>)\n"
+        f"📅 {datetime.now().strftime('%d.%m.%Y %H:%M')}\n"
+        f"{'─'*25}\n\n"
+        f"{text}"
+    )
+    # Inline button so admin can tap to reply
+    reply_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="↩️ Javob berish", callback_data=f"supReply:{uid}")
+    ]])
+    try:
+        await bot.send_message(OWNER_ID, admin_txt, reply_markup=reply_kb, parse_mode="HTML")
+    except Exception as e:
+        print(f"[SUPPORT FORWARD ERROR] {e}")
+
+    await message.answer(
+        "✅ Xabaringiz adminga yuborildi!",
+        reply_markup=get_menu(uid)
+    )
+
+# Admin clicks "↩️ Javob berish" inline button
+@dp.callback_query(F.data.startswith("supReply:"))
+async def support_reply_start(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != OWNER_ID:
+        return await callback.answer("❌ Ruxsat yo'q", show_alert=True)
+    target_uid = int(callback.data.split(":")[1])
+    await state.set_state(SupportReplyStates.waiting_reply)
+    await state.update_data(support_target_uid=target_uid)
+    await callback.answer()
+    await callback.message.reply(
+        f"✏️ <code>{target_uid}</code> foydalanuvchiga javobingizni yozing:",
+        reply_markup=kb_cancel(),
+        parse_mode="HTML"
+    )
+
+@dp.message(SupportReplyStates.waiting_reply, F.text)
+async def support_reply_send(message: types.Message, state: FSMContext):
+    data       = await state.get_data()
+    target_uid = data.get("support_target_uid")
+    await state.clear()
+    try:
+        await bot.send_message(
+            target_uid,
+            f"<b>Admin:</b>\n\n{message.text}",
+            parse_mode="HTML"
+        )
+        await message.answer("✅ Javob yuborildi.", reply_markup=get_menu(message.from_user.id))
+    except Exception as e:
+        await message.answer(f"❌ Xato: {e}")
 
 # ================================================================
 # ═══════════════  SUB-ADMIN MANAGEMENT  ═════════════════════════
@@ -1053,7 +1113,7 @@ async def pdf_start(message: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("pdftype:"))
 async def pdf_type_chosen(callback: types.CallbackQuery, state: FSMContext):
-    pdf_mode = callback.data.split(":")[1]  # "scan" or "simple"
+    pdf_mode = callback.data.split(":")[1]
     await state.set_state(PDFStates.collecting_images)
     await state.update_data(images=[], pdf_mode=pdf_mode)
     mode_label = "🔬 Skan PDF" if pdf_mode == "scan" else "📄 Oddiy PDF"
@@ -1132,7 +1192,6 @@ async def pdf_create(message: types.Message, state: FSMContext):
                 img = process_scan_image(img)
             pil_images.append(img)
 
-        # Build uniform A4 PDF with ReportLab
         build_pdf_with_reportlab(pil_images, pdf_path)
 
         for img in pil_images:
@@ -1163,6 +1222,13 @@ async def payment_info(message: types.Message):
 
 @dp.message(F.text == "✅ To'lov qildim")
 async def wait_for_check(message: types.Message, state: FSMContext):
+    uid = message.from_user.id
+    # ─── NEW: 24-hour limit ──────────────────────────────────────
+    if user_submitted_check_today(uid):
+        return await message.answer(
+            "⚠️ Siz bugungi limitdan foydalandingiz, ertaga qayta bosing."
+        )
+    # ────────────────────────────────────────────────────────────
     await state.set_state(PaymentStates.waiting_check)
     await message.answer("🧾 Chekni yuboring (rasm yoki PDF)")
 
@@ -1321,6 +1387,71 @@ async def reject_payment(callback: types.CallbackQuery):
         except Exception:
             pass
     await callback.answer("❌ Rad etildi")
+
+# ================================================================
+# ════════  PENDING PAYMENTS LIST  (NEW)  ════════════════════════
+# ================================================================
+
+@dp.message(Command("pendingpay"))
+@dp.callback_query(F.data == "adm:pending_payments")
+async def adm_pending_payments(event: types.Message | types.CallbackQuery):
+    uid = event.from_user.id
+    if not has_perm(uid, "payments"):
+        if isinstance(event, types.CallbackQuery):
+            return await event.answer("❌ Ruxsat yo'q", show_alert=True)
+        return
+
+    if isinstance(event, types.CallbackQuery):
+        await event.answer()
+        target = event.message
+    else:
+        target = event
+
+    try:
+        db = get_db()
+        try:
+            with db.cursor() as c:
+                c.execute(
+                    "SELECT p.id, p.user_id, p.created_at, u.username "
+                    "FROM payments p LEFT JOIN users u ON p.user_id=u.user_id "
+                    "WHERE p.status='pending' ORDER BY p.id DESC"
+                )
+                rows = c.fetchall()
+        finally:
+            db.close()
+    except Exception as e:
+        print(f"[PENDING PAY ERROR] {e}")
+        return await target.answer("❌ DB xato.")
+
+    if not rows:
+        return await target.answer("✅ Hozircha kutilayotgan to'lovlar yo'q.")
+
+    await target.answer(
+        f"⏳ <b>KUTILAYOTGAN TO'LOVLAR — {len(rows)} ta</b>",
+        parse_mode="HTML"
+    )
+    for r in rows:
+        uname    = f"@{r['username']}" if r.get("username") else "—"
+        date_str = r["created_at"].strftime('%d.%m.%Y %H:%M') if r.get("created_at") else "—"
+        pay_uid  = r["user_id"]
+        pay_id   = r["id"]
+        txt = (
+            f"🧾 <b>To'lov #{pay_id}</b>\n"
+            f"👤 {uname} (ID: <code>{pay_uid}</code>)\n"
+            f"📅 {date_str}"
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ 30 kun",  callback_data=f"pApprove:{pay_id}:{pay_uid}:30"),
+                InlineKeyboardButton(text="✅ 90 kun",  callback_data=f"pApprove:{pay_id}:{pay_uid}:90"),
+                InlineKeyboardButton(text="✅ 180 kun", callback_data=f"pApprove:{pay_id}:{pay_uid}:180"),
+            ],
+            [InlineKeyboardButton(text="❌ Rad etish", callback_data=f"pReject:{pay_id}:{pay_uid}")]
+        ])
+        try:
+            await target.answer(txt, reply_markup=kb, parse_mode="HTML")
+        except Exception as e:
+            print(f"[PENDING PAY SEND ERROR] {e}")
 
 # ================================================================
 # ═════════════════  ORDER FLOW  ═════════════════════════════════
@@ -1749,7 +1880,12 @@ async def broadcast_preview(message: types.Message, state: FSMContext):
     elif message.text:     msg_type = "text"
     else:
         return await message.answer("❌ Bu turdagi xabar qo'llab-quvvatlanmaydi.")
-    await state.update_data(msg_type=msg_type, from_chat_id=message.chat.id, message_id=message.message_id)
+    await state.update_data(
+        msg_type=msg_type,
+        from_chat_id=message.chat.id,
+        message_id=message.message_id,
+        original_text=message.text or message.caption or ""
+    )
     user_count = len(get_all_user_ids())
     await state.set_state(BroadcastStates.confirming)
     await message.answer(
@@ -1762,8 +1898,10 @@ async def broadcast_preview(message: types.Message, state: FSMContext):
 async def broadcast_send(callback: types.CallbackQuery, state: FSMContext):
     if not has_perm(callback.from_user.id, "broadcast"):
         return await callback.answer("❌ Ruxsat yo'q", show_alert=True)
-    data     = await state.get_data()
-    user_ids = get_all_user_ids()
+    data         = await state.get_data()
+    user_ids     = get_all_user_ids()
+    msg_type     = data.get("msg_type", "")
+    original_txt = data.get("original_text", "")
     await state.clear()
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.answer("⏳ Yuborilmoqda...")
@@ -1771,7 +1909,19 @@ async def broadcast_send(callback: types.CallbackQuery, state: FSMContext):
     success = failed = 0
     for i, uid in enumerate(user_ids, 1):
         try:
-            await bot.copy_message(chat_id=uid, from_chat_id=data["from_chat_id"], message_id=data["message_id"])
+            # ─── NEW: Prepend bold "Admin:" label to text broadcasts ──
+            if msg_type == "text" and original_txt:
+                await bot.send_message(
+                    chat_id=uid,
+                    text=f"<b>Admin:</b>\n\n{original_txt}",
+                    parse_mode="HTML"
+                )
+            else:
+                await bot.copy_message(
+                    chat_id=uid,
+                    from_chat_id=data["from_chat_id"],
+                    message_id=data["message_id"]
+                )
             success += 1
         except Exception:
             failed += 1
