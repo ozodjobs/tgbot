@@ -688,7 +688,7 @@ async def perm_toggle(callback: types.CallbackQuery, state: FSMContext):
         )
     except Exception:
         pass
-    await callback.answer(f"{'✅ Yoqildi' if perm in current_perms else '☐ O'chirildi'}: {PERM_LABELS.get(perm, perm)}")
+    await callback.answer(f"{'✅ Yoqildi' if perm in current_perms else '☐ O`chirildi'}: {PERM_LABELS.get(perm, perm)}")
 
 
 # ── Save the sub-admin ───────────────────────────────────────────
