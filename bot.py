@@ -6,6 +6,7 @@ import asyncio
 import io
 from datetime import datetime, timedelta
 
+import numpy as np
 import pymysql
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
@@ -21,6 +22,9 @@ from aiogram.types import (
 )
 from dotenv import load_dotenv
 from PIL import Image, ImageFilter, ImageOps, ImageEnhance
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas as rl_canvas
+from reportlab.lib.utils import ImageReader
 
 # ================= CONFIG =================
 load_dotenv()
@@ -74,9 +78,9 @@ Ushbu bot quyidagi imkoniyatlarni taqdim etadi:
 ━━━━━━━━━━━━━━━━━━━━━
 
 💳 <b>PREMIUM OBUNA</b>
-  • 1 oy — 20 000 so'm
-  • 3 oy — 50 000 so'm
-  • 6 oy — 90 000 so'm
+  • 1 oy — 30 000 so'm
+  • 3 oy — 80 000 so'm
+  • 6 oy — 150 000 so'm
 
 ━━━━━━━━━━━━━━━━━━━━━
 
@@ -244,11 +248,12 @@ menu_premium = ReplyKeyboardMarkup(
 )
 
 def menu_pdf_collecting(count: int, pdf_mode: str) -> ReplyKeyboardMarkup:
-    mode_label = "🔬 Skan" if pdf_mode == "scan" else "📄 Oddiy"
+    # CHANGED: Removed the image-count display button and mode-toggle button.
+    # Only keep the action buttons to keep the UI clean.
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="📥 PDF yaratish"), KeyboardButton(text=f"🖼 Rasmlar: {count}")],
-            [KeyboardButton(text="🗑 Tozalash"), KeyboardButton(text=f"[{mode_label}]")],
+            [KeyboardButton(text="📥 PDF yaratish")],
+            [KeyboardButton(text="🗑 Tozalash")],
             [KeyboardButton(text="❌ Bekor qilish")]
         ],
         resize_keyboard=True
@@ -505,29 +510,93 @@ def build_admin_text(stats: dict, uid: int) -> str:
     base += f"\n📅 {datetime.now().strftime('%d.%m.%Y %H:%M')}"
     return base
 
-# ================= SCAN PROCESSING (CamScanner style) =================
+# ================================================================
+# ═════════  SCAN PROCESSING — Adaptive (CamScanner style)  ══════
+# ================================================================
 def process_scan_image(img: Image.Image) -> Image.Image:
-    """Process image to look like a professional document scan."""
-    # Convert to grayscale
+    """
+    Advanced adaptive-threshold scan processing.
+
+    Key improvements over a simple global threshold:
+    • Uses a large Gaussian blur as the "local background estimator" — this
+      means shadowed or unevenly lit areas are compared to their *own* local
+      brightness, not a single global cutoff.  Dark corners that are still
+      lighter than the text get turned white; text stays black.
+    • Pixels darker than (local_background − offset) → pure black (ink/text).
+    • Everything else → pure white (paper/background).
+    • A final hard threshold and unsharp-mask pass makes thin text bolder and
+      removes any remaining gray fringing.
+    """
+    # 1. Grayscale + sharpness boost to crisp up text edges
     img = img.convert("L")
+    img = ImageEnhance.Sharpness(img).enhance(3.0)
 
-    # Increase contrast
-    enhancer = ImageEnhance.Contrast(img)
-    img = enhancer.enhance(2.5)
+    # 2. Compute local background via large Gaussian blur
+    h, w = img.size[1], img.size[0]
+    blur_radius = max(30, min(h, w) // 15)
+    bg_img = img.filter(ImageFilter.GaussianBlur(radius=blur_radius))
 
-    # Increase sharpness
-    enhancer = ImageEnhance.Sharpness(img)
-    img = enhancer.enhance(2.0)
+    arr = np.array(img, dtype=np.float32)
+    bg  = np.array(bg_img, dtype=np.float32)
 
-    # Apply threshold to make background white and text black
-    threshold = 180
-    img = img.point(lambda x: 0 if x < threshold else 255, '1')
-    img = img.convert("L")
+    # 3. Adaptive binarization:
+    #    pixel is "ink" if it is >offset brightness units darker than local bg
+    offset = 15          # lower = more aggressive; raise if thin text disappears
+    binary = np.where(arr < (bg - offset), 0, 255).astype(np.uint8)
 
-    # Convert back to RGB (white bg, black text) for PDF
-    result = Image.new("RGB", img.size, (255, 255, 255))
-    result.paste(img)
-    return result
+    # 4. Hard threshold to eliminate gray artifacts
+    result_img = Image.fromarray(binary, mode="L")
+    result_img = result_img.point(lambda x: 0 if x < 128 else 255)
+
+    # 5. Unsharp mask → make text slightly bolder, then threshold again
+    result_img = result_img.filter(
+        ImageFilter.UnsharpMask(radius=1, percent=150, threshold=3)
+    )
+    result_img = result_img.point(lambda x: 0 if x < 180 else 255)
+
+    # 6. Return as RGB (white paper, pure black text)
+    out = Image.new("RGB", result_img.size, (255, 255, 255))
+    out.paste(result_img)
+    return out
+
+# ================================================================
+# ═════════  PDF BUILDER — Uniform A4 pages via ReportLab  ═══════
+# ================================================================
+def build_pdf_with_reportlab(pil_images: list, pdf_path: str):
+    """
+    Creates a professional PDF where every page is exactly A4 (210×297 mm).
+    Each image is proportionally scaled to fill the printable area and
+    centered on a crisp white page.  No distortion, no black bars.
+    """
+    PAGE_W, PAGE_H = A4      # 595.27 × 841.89 pt  (~72 pt = 1 inch)
+    MARGIN = 28              # ~1 cm margin on every side
+
+    usable_w = PAGE_W - 2 * MARGIN
+    usable_h = PAGE_H - 2 * MARGIN
+
+    c = rl_canvas.Canvas(pdf_path, pagesize=A4)
+
+    for pil_img in pil_images:
+        img_w, img_h = pil_img.size
+
+        # Scale to fit within usable area while preserving aspect ratio
+        scale  = min(usable_w / img_w, usable_h / img_h)
+        draw_w = img_w * scale
+        draw_h = img_h * scale
+
+        # Center on the page
+        x = MARGIN + (usable_w - draw_w) / 2
+        y = MARGIN + (usable_h - draw_h) / 2
+
+        # Write image into an in-memory buffer for ReportLab
+        buf = io.BytesIO()
+        pil_img.save(buf, format="JPEG", quality=92, optimize=True)
+        buf.seek(0)
+
+        c.drawImage(ImageReader(buf), x, y, width=draw_w, height=draw_h)
+        c.showPage()
+
+    c.save()
 
 # ================= EXCEL BUILDER =================
 def build_users_excel(rows: list) -> bytes:
@@ -965,7 +1034,6 @@ async def cancel_any(message: types.Message, state: FSMContext):
 @dp.message(F.text == "📄 PDF yaratish")
 async def pdf_start(message: types.Message, state: FSMContext):
     current_state = await state.get_state()
-    # If already collecting images, show status
     if current_state == PDFStates.collecting_images.state:
         data = await state.get_data()
         images   = data.get("images", [])
@@ -1023,7 +1091,7 @@ async def pdf_clear_images(message: types.Message, state: FSMContext):
         cleanup_files(p)
     await state.update_data(images=[])
     await message.answer(
-        f"🗑 Barcha rasmlar o'chirildi.\nQaytadan rasm yuborishingiz mumkin.",
+        "🗑 Barcha rasmlar o'chirildi.\nQaytadan rasm yuborishingiz mumkin.",
         reply_markup=menu_pdf_collecting(0, pdf_mode)
     )
 
@@ -1064,7 +1132,9 @@ async def pdf_create(message: types.Message, state: FSMContext):
                 img = process_scan_image(img)
             pil_images.append(img)
 
-        pil_images[0].save(pdf_path, save_all=True, append_images=pil_images[1:])
+        # Build uniform A4 PDF with ReportLab
+        build_pdf_with_reportlab(pil_images, pdf_path)
+
         for img in pil_images:
             img.close()
 
@@ -1102,7 +1172,6 @@ async def receive_check(message: types.Message, state: FSMContext):
     uid = message.from_user.id
     await state.clear()
 
-    # Save payment record
     try:
         db = get_db()
         try:
