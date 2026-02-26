@@ -1,6 +1,7 @@
 import os
 import re
 import uuid
+import json
 import asyncio
 import io
 from datetime import datetime, timedelta
@@ -25,7 +26,12 @@ from PIL import Image
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-ADMIN_IDS = {6875167708}
+# ── Owner (you) — hardcoded, cannot be removed or changed via bot ──
+OWNER_ID = 6875167708
+
+# Legacy alias so existing code that checks `ADMIN_IDS` still works.
+# Sub-admins are loaded from DB at runtime via is_admin() / has_perm().
+ADMIN_IDS = {OWNER_ID}
 
 PAYNET_LINK = "https://app.paynet.uz/?m=49156&i=1abfad1a-2da7-4d8d-8509-39f59b32d538"
 
@@ -36,20 +42,36 @@ TARIFFS = {
 }
 
 ORDER_LIMIT_PER_MONTH = 10
-
 DEADLINE_OPTIONS = ["1 kun", "2 kun", "3 kun", "5 kun", "7 kun", "10 kun"]
-
 ORDER_TYPES = {
     "referat":  "📝 Referat",
     "mustaqil": "📘 Mustaqil ish"
 }
-
 FILETYPE_LABELS = [
     "📄 PDF",
     "📝 Word (.docx)",
     "📊 Excel (.xlsx)",
     "📊 PowerPoint (.pptx)"
 ]
+
+# ── All available permissions ──────────────────────────────────────
+ALL_PERMS = [
+    "payments",    # approve/reject payments
+    "orders",      # view/accept/reject orders, deliver files
+    "broadcast",   # send broadcast
+    "revoke",      # revoke premium
+    "users",       # view user list
+    "listusers",   # export Excel user list
+]
+
+PERM_LABELS = {
+    "payments":  "💳 To'lovlar",
+    "orders":    "📋 Buyurtmalar",
+    "broadcast": "📢 Broadcast",
+    "revoke":    "🚫 Premium bekor",
+    "users":     "👥 Userlar",
+    "listusers": "📊 Excel ro'yxat",
+}
 
 # ================= FSM STATES =================
 class PDFStates(StatesGroup):
@@ -78,6 +100,11 @@ class BroadcastStates(StatesGroup):
 class RevokeStates(StatesGroup):
     waiting_user_id = State()
 
+# NEW FSM for assigning sub-admins
+class SubAdminStates(StatesGroup):
+    waiting_user_id   = State()   # owner enters user_id
+    choosing_perms    = State()   # owner toggles permissions
+
 # ================= DB =================
 def get_db():
     return pymysql.connect(
@@ -90,6 +117,85 @@ def get_db():
         autocommit=True,
         connect_timeout=10
     )
+
+def ensure_admins_table():
+    """Create admins table if it doesn't exist yet."""
+    try:
+        db = get_db()
+        try:
+            with db.cursor() as c:
+                c.execute("""
+                    CREATE TABLE IF NOT EXISTS admins (
+                        user_id    BIGINT PRIMARY KEY,
+                        username   VARCHAR(255) DEFAULT NULL,
+                        perms      TEXT NOT NULL DEFAULT '[]',
+                        added_at   DATETIME DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+        finally:
+            db.close()
+    except Exception as e:
+        print(f"[ensure_admins_table ERROR] {e}")
+
+# ================= PERMISSION HELPERS =================
+def get_sub_admin(uid: int) -> dict | None:
+    """Return the sub-admin row or None."""
+    try:
+        db = get_db()
+        try:
+            with db.cursor() as c:
+                c.execute("SELECT * FROM admins WHERE user_id=%s", (uid,))
+                return c.fetchone()
+        finally:
+            db.close()
+    except Exception as e:
+        print(f"[get_sub_admin ERROR] {e}")
+        return None
+
+def is_any_admin(uid: int) -> bool:
+    """True if owner OR has a row in admins table."""
+    if uid == OWNER_ID:
+        return True
+    return get_sub_admin(uid) is not None
+
+def has_perm(uid: int, perm: str) -> bool:
+    """True if owner (all perms) or sub-admin with this specific perm."""
+    if uid == OWNER_ID:
+        return True
+    row = get_sub_admin(uid)
+    if not row:
+        return False
+    try:
+        perms = json.loads(row["perms"])
+        return perm in perms
+    except Exception:
+        return False
+
+def get_admin_perms(uid: int) -> list:
+    """Return list of perms for a sub-admin (empty list for non-admins)."""
+    if uid == OWNER_ID:
+        return list(ALL_PERMS)
+    row = get_sub_admin(uid)
+    if not row:
+        return []
+    try:
+        return json.loads(row["perms"])
+    except Exception:
+        return []
+
+def all_sub_admins() -> list:
+    """Return all rows from admins table."""
+    try:
+        db = get_db()
+        try:
+            with db.cursor() as c:
+                c.execute("SELECT * FROM admins ORDER BY added_at DESC")
+                return c.fetchall()
+        finally:
+            db.close()
+    except Exception as e:
+        print(f"[all_sub_admins ERROR] {e}")
+        return []
 
 # ================= BOT =================
 bot = Bot(token=BOT_TOKEN)
@@ -119,74 +225,126 @@ menu_premium = ReplyKeyboardMarkup(
 def menu_pdf_collecting(count: int) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [
-                KeyboardButton(text="📥 PDF yaratish"),
-                KeyboardButton(text=f"🖼 Rasmlar: {count}")
-            ],
+            [KeyboardButton(text="📥 PDF yaratish"), KeyboardButton(text=f"🖼 Rasmlar: {count}")],
             [KeyboardButton(text="❌ Bekor qilish")]
         ],
         resize_keyboard=True
     )
 
-# ================= ADMIN INLINE PANEL =================
-def admin_panel_kb() -> InlineKeyboardMarkup:
+# ================= ADMIN PANEL KEYBOARDS =================
+def admin_panel_kb(uid: int) -> InlineKeyboardMarkup:
+    """Build admin panel buttons based on caller's permissions."""
+    rows = []
+    if has_perm(uid, "users") or has_perm(uid, "payments"):
+        row = []
+        if has_perm(uid, "users"):
+            row.append(InlineKeyboardButton(text="👥 Userlar", callback_data="adm:users"))
+        if has_perm(uid, "payments"):
+            row.append(InlineKeyboardButton(text="💳 To'lovlar", callback_data="adm:payments"))
+        rows.append(row)
+
+    row2 = []
+    if has_perm(uid, "orders"):
+        row2.append(InlineKeyboardButton(text="⏰ Tugayotganlar", callback_data="adm:expiring"))
+        row2.append(InlineKeyboardButton(text="📋 Buyurtmalar",   callback_data="adm:orders"))
+    if row2:
+        rows.append(row2)
+
+    row3 = []
+    if has_perm(uid, "broadcast"):
+        row3.append(InlineKeyboardButton(text="📢 Broadcast", callback_data="adm:broadcast"))
+    if has_perm(uid, "revoke"):
+        row3.append(InlineKeyboardButton(text="🚫 Premium bekor", callback_data="adm:revoke"))
+    if row3:
+        rows.append(row3)
+
+    if has_perm(uid, "listusers"):
+        rows.append([InlineKeyboardButton(text="📊 Userlar ro'yxati (Excel)", callback_data="adm:listusers")])
+
+    # Owner-only: manage sub-admins
+    if uid == OWNER_ID:
+        rows.append([InlineKeyboardButton(text="🛡 Sub-adminlar", callback_data="adm:subadmins")])
+
+    rows.append([InlineKeyboardButton(text="🔄 Yangilash", callback_data="adm:refresh")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def perm_toggle_kb(target_uid: int, current_perms: list) -> InlineKeyboardMarkup:
+    """
+    Keyboard for toggling individual permissions when assigning a sub-admin.
+    Each button shows ✅ if enabled or ☐ if disabled.
+    """
+    rows = []
+    for perm in ALL_PERMS:
+        label = PERM_LABELS[perm]
+        check = "✅" if perm in current_perms else "☐"
+        rows.append([InlineKeyboardButton(
+            text=f"{check} {label}",
+            callback_data=f"permToggle:{target_uid}:{perm}"
+        )])
+    rows.append([
+        InlineKeyboardButton(text="💾 Saqlash",        callback_data=f"permSave:{target_uid}"),
+        InlineKeyboardButton(text="❌ Bekor qilish",   callback_data="permCancel"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def subadmins_list_kb(admins: list) -> InlineKeyboardMarkup:
+    rows = []
+    for a in admins:
+        uname = f"@{a['username']}" if a.get("username") else f"ID:{a['user_id']}"
+        try:
+            cnt = len(json.loads(a["perms"]))
+        except Exception:
+            cnt = 0
+        rows.append([InlineKeyboardButton(
+            text=f"🛡 {uname} ({cnt} ruxsat)",
+            callback_data=f"subadmView:{a['user_id']}"
+        )])
+    rows.append([
+        InlineKeyboardButton(text="➕ Yangi sub-admin qo'shish", callback_data="subadmAdd"),
+    ])
+    rows.append([InlineKeyboardButton(text="🔙 Orqaga", callback_data="adm:refresh")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def subadmin_detail_kb(target_uid: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="👥 Userlar",       callback_data="adm:users"),
-            InlineKeyboardButton(text="💳 To'lovlar",     callback_data="adm:payments"),
+            InlineKeyboardButton(text="✏️ Ruxsatlarni o'zgartirish", callback_data=f"subadmEdit:{target_uid}"),
+            InlineKeyboardButton(text="🗑 O'chirish",                 callback_data=f"subadmDel:{target_uid}"),
         ],
-        [
-            InlineKeyboardButton(text="⏰ Tugayotganlar",  callback_data="adm:expiring"),
-            InlineKeyboardButton(text="📋 Buyurtmalar",   callback_data="adm:orders"),
-        ],
-        [
-            InlineKeyboardButton(text="📢 Broadcast",     callback_data="adm:broadcast"),
-            InlineKeyboardButton(text="🚫 Premium bekor", callback_data="adm:revoke"),
-        ],
-        [
-            # NEW BUTTON — opens /listusers
-            InlineKeyboardButton(text="📊 Userlar ro'yxati (Excel)", callback_data="adm:listusers"),
-        ],
-        [
-            InlineKeyboardButton(text="🔄 Yangilash",     callback_data="adm:refresh"),
-        ]
+        [InlineKeyboardButton(text="🔙 Orqaga", callback_data="adm:subadmins")],
     ])
 
-# ================= KEYBOARDS =================
+# ================= OTHER KEYBOARDS =================
 def kb_pages():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="5"),  KeyboardButton(text="10"), KeyboardButton(text="15")],
             [KeyboardButton(text="20"), KeyboardButton(text="25")],
             [KeyboardButton(text="❌ Bekor qilish")]
-        ],
-        resize_keyboard=True
+        ], resize_keyboard=True
     )
 
 def kb_filetype():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="📄 PDF"),            KeyboardButton(text="📝 Word (.docx)")],
-            [KeyboardButton(text="📊 Excel (.xlsx)"),  KeyboardButton(text="📊 PowerPoint (.pptx)")],
+            [KeyboardButton(text="📄 PDF"),           KeyboardButton(text="📝 Word (.docx)")],
+            [KeyboardButton(text="📊 Excel (.xlsx)"), KeyboardButton(text="📊 PowerPoint (.pptx)")],
             [KeyboardButton(text="❌ Bekor qilish")]
-        ],
-        resize_keyboard=True
+        ], resize_keyboard=True
     )
 
 def kb_deadline():
-    row1 = [KeyboardButton(text=d) for d in DEADLINE_OPTIONS[:3]]
-    row2 = [KeyboardButton(text=d) for d in DEADLINE_OPTIONS[3:]]
     return ReplyKeyboardMarkup(
-        keyboard=[row1, row2, [KeyboardButton(text="❌ Bekor qilish")]],
-        resize_keyboard=True
+        keyboard=[
+            [KeyboardButton(text=d) for d in DEADLINE_OPTIONS[:3]],
+            [KeyboardButton(text=d) for d in DEADLINE_OPTIONS[3:]],
+            [KeyboardButton(text="❌ Bekor qilish")]
+        ], resize_keyboard=True
     )
 
 def kb_confirm():
     return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="✅ Tasdiqlash")],
-            [KeyboardButton(text="❌ Bekor qilish")]
-        ],
+        keyboard=[[KeyboardButton(text="✅ Tasdiqlash")], [KeyboardButton(text="❌ Bekor qilish")]],
         resize_keyboard=True
     )
 
@@ -197,12 +355,10 @@ def kb_cancel():
     )
 
 def kb_broadcast_confirm():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Yuborish",     callback_data="bc:send"),
-            InlineKeyboardButton(text="❌ Bekor qilish", callback_data="bc:cancel"),
-        ]
-    ])
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Yuborish",     callback_data="bc:send"),
+        InlineKeyboardButton(text="❌ Bekor qilish", callback_data="bc:cancel"),
+    ]])
 
 # ================= HELPERS =================
 def has_access(uid: int) -> bool:
@@ -229,10 +385,8 @@ def sanitize_filename(name: str) -> str:
 def cleanup_files(*paths):
     for p in paths:
         if p and os.path.exists(p):
-            try:
-                os.remove(p)
-            except OSError:
-                pass
+            try: os.remove(p)
+            except OSError: pass
 
 def format_deadline(deadline_val) -> str:
     if not deadline_val:
@@ -246,14 +400,8 @@ def get_order_monthly_count(uid: int) -> int:
         db = get_db()
         try:
             with db.cursor() as c:
-                month_start = datetime.now().replace(
-                    day=1, hour=0, minute=0, second=0, microsecond=0
-                )
-                c.execute(
-                    "SELECT COUNT(*) AS c FROM orders "
-                    "WHERE user_id=%s AND created_at >= %s",
-                    (uid, month_start)
-                )
+                month_start = datetime.now().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+                c.execute("SELECT COUNT(*) AS c FROM orders WHERE user_id=%s AND created_at >= %s", (uid, month_start))
                 return c.fetchone()["c"]
         finally:
             db.close()
@@ -268,8 +416,7 @@ def get_active_order(uid: int):
             with db.cursor() as c:
                 c.execute(
                     "SELECT id, type, subject, topic, status FROM orders "
-                    "WHERE user_id=%s AND status IN ('pending','in_progress') "
-                    "ORDER BY id DESC LIMIT 1",
+                    "WHERE user_id=%s AND status IN ('pending','in_progress') ORDER BY id DESC LIMIT 1",
                     (uid,)
                 )
                 return c.fetchone()
@@ -306,168 +453,437 @@ def get_admin_stats() -> dict:
             with db.cursor() as c:
                 c.execute("SELECT COUNT(*) AS c FROM users")
                 total = c.fetchone()["c"]
-                c.execute(
-                    "SELECT COUNT(*) AS c FROM users WHERE access_until > %s",
-                    (datetime.now(),)
-                )
+                c.execute("SELECT COUNT(*) AS c FROM users WHERE access_until > %s", (datetime.now(),))
                 premium = c.fetchone()["c"]
                 c.execute("SELECT COUNT(*) AS c FROM payments WHERE status='pending'")
                 pending_pay = c.fetchone()["c"]
-                c.execute(
-                    "SELECT COUNT(*) AS c FROM orders "
-                    "WHERE status IN ('pending','in_progress')"
-                )
+                c.execute("SELECT COUNT(*) AS c FROM orders WHERE status IN ('pending','in_progress')")
                 active_orders = c.fetchone()["c"]
-            return {
-                "total": total,
-                "premium": premium,
-                "pending_pay": pending_pay,
-                "active_orders": active_orders
-            }
+            return {"total": total, "premium": premium, "pending_pay": pending_pay, "active_orders": active_orders}
         finally:
             db.close()
     except Exception as e:
         print(f"[get_admin_stats ERROR] {e}")
         return {"total": 0, "premium": 0, "pending_pay": 0, "active_orders": 0}
 
-def build_admin_text(stats: dict) -> str:
-    return (
-        f"📊 <b>ADMIN PANEL</b>\n\n"
+def build_admin_text(stats: dict, uid: int) -> str:
+    role = "👑 OWNER" if uid == OWNER_ID else "🛡 SUB-ADMIN"
+    sub_cnt = len(all_sub_admins())
+    base = (
+        f"📊 <b>ADMIN PANEL</b>  [{role}]\n\n"
         f"👤 Jami userlar:        <b>{stats['total']}</b>\n"
         f"✅ Premium:             <b>{stats['premium']}</b>\n"
         f"⏳ Kutilayotgan to'lov: <b>{stats['pending_pay']}</b>\n"
-        f"📋 Aktiv buyurtmalar:   <b>{stats['active_orders']}</b>\n\n"
-        f"📅 {datetime.now().strftime('%d.%m.%Y %H:%M')}"
+        f"📋 Aktiv buyurtmalar:   <b>{stats['active_orders']}</b>\n"
     )
+    if uid == OWNER_ID:
+        base += f"🛡 Sub-adminlar:        <b>{sub_cnt}</b>\n"
+    base += f"\n📅 {datetime.now().strftime('%d.%m.%Y %H:%M')}"
+    return base
 
-# ================================================================
-# NEW: USER LIST EXCEL BUILDER
-# ================================================================
+# ================= EXCEL BUILDER =================
 def build_users_excel(rows: list) -> bytes:
-    """
-    Builds a styled .xlsx file of all users and returns it as bytes.
-    Columns: #, User ID, Username, Status, Access Until, Registered
-    Premium rows are highlighted green; alternating rows are light blue.
-    A summary row is appended at the bottom.
-    """
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Foydalanuvchilar"
-
-    # ── Header styles ──────────────────────────────────────────
-    header_fill = PatternFill("solid", fgColor="1E3A8A")   # dark blue
-    header_font = Font(bold=True, color="FFFFFF", name="Arial", size=11)
+    header_fill  = PatternFill("solid", fgColor="1E3A8A")
+    header_font  = Font(bold=True, color="FFFFFF", name="Arial", size=11)
     center_align = Alignment(horizontal="center", vertical="center")
     left_align   = Alignment(horizontal="left",   vertical="center")
-
     headers    = ["#", "User ID", "Username", "Status", "Obuna tugashi", "Ro'yxatdan o'tgan"]
     col_widths = [5,   16,        24,          14,       18,              22]
-
     for col_idx, (header, width) in enumerate(zip(headers, col_widths), start=1):
-        cell                    = ws.cell(row=1, column=col_idx, value=header)
-        cell.font               = header_font
-        cell.fill               = header_fill
-        cell.alignment          = center_align
+        cell = ws.cell(row=1, column=col_idx, value=header)
+        cell.font, cell.fill, cell.alignment = header_font, header_fill, center_align
         ws.column_dimensions[cell.column_letter].width = width
-
     ws.row_dimensions[1].height = 22
-
-    # ── Row styles ────────────────────────────────────────────
     now = datetime.now()
-
-    premium_fill = PatternFill("solid", fgColor="DCFCE7")  # light green
-    normal_fill  = PatternFill("solid", fgColor="F8FAFC")  # off-white
-    alt_fill     = PatternFill("solid", fgColor="EFF6FF")  # light blue
+    premium_fill = PatternFill("solid", fgColor="DCFCE7")
+    normal_fill  = PatternFill("solid", fgColor="F8FAFC")
+    alt_fill     = PatternFill("solid", fgColor="EFF6FF")
     premium_font = Font(name="Arial", size=10, color="166534", bold=True)
     normal_font  = Font(name="Arial", size=10, color="1E293B")
-
     for i, r in enumerate(rows, start=1):
         row_num    = i + 1
         is_premium = bool(r.get("access_until") and r["access_until"] > now)
-
         username   = f"@{r['username']}" if r.get("username") else "—"
         status     = "✅ Premium" if is_premium else "👤 Oddiy"
         access_str = r["access_until"].strftime("%d.%m.%Y") if r.get("access_until") else "—"
         reg_str    = r["created_at"].strftime("%d.%m.%Y %H:%M") if r.get("created_at") else "—"
-
-        row_data = [i, r["user_id"], username, status, access_str, reg_str]
-
+        row_data   = [i, r["user_id"], username, status, access_str, reg_str]
         fill = premium_fill if is_premium else (alt_fill if i % 2 == 0 else normal_fill)
         font = premium_font if is_premium else normal_font
-
         for col_idx, value in enumerate(row_data, start=1):
-            cell           = ws.cell(row=row_num, column=col_idx, value=value)
+            cell = ws.cell(row=row_num, column=col_idx, value=value)
             cell.fill      = fill
             cell.font      = font
             cell.alignment = center_align if col_idx in (1, 2, 4, 5) else left_align
-
         ws.row_dimensions[row_num].height = 18
-
-    # ── Summary row ──────────────────────────────────────────
-    total_users  = len(rows)
-    premium_cnt  = sum(1 for r in rows if r.get("access_until") and r["access_until"] > now)
-    summary_row  = total_users + 3
-
-    s_fill = PatternFill("solid", fgColor="FEF9C3")   # yellow
+    total_users = len(rows)
+    premium_cnt = sum(1 for r in rows if r.get("access_until") and r["access_until"] > now)
+    summary_row = total_users + 3
+    s_fill = PatternFill("solid", fgColor="FEF9C3")
     s_font = Font(bold=True, name="Arial", size=10, color="713F12")
-
-    summary_data = [
-        (1, "Jami foydalanuvchi:"),
-        (2, total_users),
-        (3, "Premium:"),
-        (4, premium_cnt),
-        (5, f"Sana: {now.strftime('%d.%m.%Y %H:%M')}"),
-    ]
-    for col_idx, value in summary_data:
-        cell           = ws.cell(row=summary_row, column=col_idx, value=value)
-        cell.font      = s_font
-        cell.fill      = s_fill
-        cell.alignment = center_align
-
-    # ── Freeze top row ────────────────────────────────────────
+    for col_idx, value in [(1,"Jami:"),(2,total_users),(3,"Premium:"),(4,premium_cnt),(5,f"Sana: {now.strftime('%d.%m.%Y %H:%M')}")]:
+        cell = ws.cell(row=summary_row, column=col_idx, value=value)
+        cell.font, cell.fill, cell.alignment = s_font, s_fill, center_align
     ws.freeze_panes = "A2"
-
-    # ── Save to in-memory bytes ───────────────────────────────
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
     return buf.read()
 
+# ================================================================
+# ═══════════════  SUB-ADMIN MANAGEMENT  ═════════════════════════
+# ================================================================
+
+@dp.message(Command("admins"))
+@dp.callback_query(F.data == "adm:subadmins")
+async def subadmins_panel(event: types.Message | types.CallbackQuery):
+    uid = event.from_user.id
+    if uid != OWNER_ID:
+        if isinstance(event, types.CallbackQuery):
+            return await event.answer("❌ Faqat owner uchun", show_alert=True)
+        return
+
+    admins = all_sub_admins()
+    text   = (
+        f"🛡 <b>SUB-ADMINLAR</b>\n\n"
+        f"Jami: <b>{len(admins)}</b> ta sub-admin\n\n"
+        + (
+            "\n".join(
+                f"• {'@'+a['username'] if a.get('username') else 'ID:'+str(a['user_id'])}  "
+                f"({len(json.loads(a['perms']))} ruxsat)"
+                for a in admins
+            ) if admins else "Hozircha sub-admin yo'q."
+        )
+    )
+    kb = subadmins_list_kb(admins)
+
+    if isinstance(event, types.CallbackQuery):
+        await event.answer()
+        try:
+            await event.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        except Exception:
+            await event.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    else:
+        await event.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+# ── View a single sub-admin ──────────────────────────────────────
+@dp.callback_query(F.data.startswith("subadmView:"))
+async def subadm_view(callback: types.CallbackQuery):
+    if callback.from_user.id != OWNER_ID:
+        return await callback.answer("❌ Ruxsat yo'q", show_alert=True)
+    target_uid = int(callback.data.split(":")[1])
+    row = get_sub_admin(target_uid)
+    if not row:
+        await callback.answer("❌ Topilmadi", show_alert=True)
+        return
+    try:
+        perms = json.loads(row["perms"])
+    except Exception:
+        perms = []
+    uname    = f"@{row['username']}" if row.get("username") else f"ID:{target_uid}"
+    added_at = row["added_at"].strftime('%d.%m.%Y %H:%M') if row.get("added_at") else "—"
+    perm_txt = "\n".join(f"  {'✅' if p in perms else '☐'} {PERM_LABELS.get(p, p)}" for p in ALL_PERMS)
+    text = (
+        f"🛡 <b>SUB-ADMIN: {uname}</b>\n"
+        f"🆔 ID: <code>{target_uid}</code>\n"
+        f"📅 Qo'shilgan: {added_at}\n\n"
+        f"<b>Ruxsatlar:</b>\n{perm_txt}"
+    )
+    await callback.answer()
+    try:
+        await callback.message.edit_text(text, reply_markup=subadmin_detail_kb(target_uid), parse_mode="HTML")
+    except Exception:
+        await callback.message.answer(text, reply_markup=subadmin_detail_kb(target_uid), parse_mode="HTML")
+
+
+# ── Start adding a new sub-admin ─────────────────────────────────
+@dp.callback_query(F.data == "subadmAdd")
+async def subadm_add_start(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != OWNER_ID:
+        return await callback.answer("❌ Ruxsat yo'q", show_alert=True)
+    await callback.answer()
+    await state.set_state(SubAdminStates.waiting_user_id)
+    await callback.message.answer(
+        "🛡 <b>YANGI SUB-ADMIN</b>\n\n"
+        "Admin qilmoqchi bo'lgan foydalanuvchining <b>User ID</b>sini yuboring:\n"
+        "<i>Masalan: 123456789</i>",
+        reply_markup=kb_cancel(), parse_mode="HTML"
+    )
+
+
+@dp.message(SubAdminStates.waiting_user_id, F.text)
+async def subadm_got_uid(message: types.Message, state: FSMContext):
+    if message.from_user.id != OWNER_ID:
+        return
+    text = message.text.strip()
+    if not text.lstrip("-").isdigit():
+        return await message.answer("❌ Noto'g'ri format. Faqat raqam kiriting:")
+    target_uid = int(text)
+    if target_uid == OWNER_ID:
+        return await message.answer("❌ O'zingizni sub-admin qila olmaysiz.")
+
+    # Check if already sub-admin
+    existing = get_sub_admin(target_uid)
+    current_perms = []
+    if existing:
+        try:
+            current_perms = json.loads(existing["perms"])
+        except Exception:
+            current_perms = []
+
+    # Try to get username from users table
+    username = None
+    try:
+        db = get_db()
+        try:
+            with db.cursor() as c:
+                c.execute("SELECT username FROM users WHERE user_id=%s", (target_uid,))
+                row = c.fetchone()
+                if row:
+                    username = row["username"]
+        finally:
+            db.close()
+    except Exception:
+        pass
+
+    await state.set_state(SubAdminStates.choosing_perms)
+    await state.update_data(target_uid=target_uid, current_perms=current_perms, target_username=username)
+
+    uname_str = f"@{username}" if username else f"ID:{target_uid}"
+    action    = "tahrirlash" if existing else "qo'shish"
+    await message.answer(
+        f"🛡 <b>Sub-admin {action}: {uname_str}</b>\n\n"
+        f"Quyidagi ruxsatlarni tanlang (✅ yoqilgan, ☐ o'chirilgan).\n"
+        f"Tayyor bo'lgach <b>💾 Saqlash</b>ni bosing.",
+        reply_markup=perm_toggle_kb(target_uid, current_perms),
+        parse_mode="HTML"
+    )
+
+
+# ── Toggle a permission ──────────────────────────────────────────
+@dp.callback_query(F.data.startswith("permToggle:"))
+async def perm_toggle(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != OWNER_ID:
+        return await callback.answer("❌ Ruxsat yo'q", show_alert=True)
+    _, target_uid_str, perm = callback.data.split(":")
+    target_uid = int(target_uid_str)
+
+    data = await state.get_data()
+    current_perms = list(data.get("current_perms", []))
+
+    if perm in current_perms:
+        current_perms.remove(perm)
+    else:
+        current_perms.append(perm)
+
+    await state.update_data(current_perms=current_perms)
+
+    try:
+        await callback.message.edit_reply_markup(
+            reply_markup=perm_toggle_kb(target_uid, current_perms)
+        )
+    except Exception:
+        pass
+    await callback.answer(f"{'✅ Yoqildi' if perm in current_perms else '☐ O'chirildi'}: {PERM_LABELS.get(perm, perm)}")
+
+
+# ── Save the sub-admin ───────────────────────────────────────────
+@dp.callback_query(F.data.startswith("permSave:"))
+async def perm_save(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != OWNER_ID:
+        return await callback.answer("❌ Ruxsat yo'q", show_alert=True)
+    target_uid = int(callback.data.split(":")[1])
+    data = await state.get_data()
+    current_perms   = data.get("current_perms", [])
+    target_username = data.get("target_username")
+
+    perms_json = json.dumps(current_perms)
+    try:
+        db = get_db()
+        try:
+            with db.cursor() as c:
+                c.execute(
+                    """INSERT INTO admins (user_id, username, perms, added_at)
+                       VALUES (%s, %s, %s, %s)
+                       ON DUPLICATE KEY UPDATE username=%s, perms=%s""",
+                    (target_uid, target_username, perms_json, datetime.now(),
+                     target_username, perms_json)
+                )
+        finally:
+            db.close()
+    except Exception as e:
+        print(f"[PERM SAVE ERROR] {e}")
+        await callback.answer("❌ DB xato", show_alert=True)
+        await state.clear()
+        return
+
+    await state.clear()
+    uname_str = f"@{target_username}" if target_username else f"ID:{target_uid}"
+    perm_txt  = ", ".join(PERM_LABELS.get(p, p) for p in current_perms) or "Hech biri"
+
+    await callback.answer("✅ Saqlandi")
+    try:
+        await callback.message.edit_text(
+            f"✅ <b>Sub-admin saqlandi!</b>\n\n"
+            f"👤 {uname_str}\n"
+            f"🔑 Ruxsatlar: {perm_txt}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🔙 Sub-adminlar", callback_data="adm:subadmins")
+            ]]),
+            parse_mode="HTML"
+        )
+    except Exception:
+        await callback.message.answer(
+            f"✅ Sub-admin saqlandi: {uname_str}\nRuxsatlar: {perm_txt}",
+            parse_mode="HTML"
+        )
+
+    # Notify the new sub-admin
+    try:
+        perm_list = "\n".join(f"  • {PERM_LABELS.get(p,p)}" for p in current_perms) or "  • Hech biri"
+        await bot.send_message(
+            target_uid,
+            f"🛡 <b>Siz sub-admin sifatida tayinlandingiz!</b>\n\n"
+            f"Sizga berilgan ruxsatlar:\n{perm_list}\n\n"
+            f"Admin panelni ochish uchun /admin buyrug'ini yuboring.",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        print(f"[NOTIFY SUBADMIN ERROR] {e}")
+
+
+# ── Cancel permission selection ──────────────────────────────────
+@dp.callback_query(F.data == "permCancel")
+async def perm_cancel(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.answer("❌ Bekor qilindi")
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await callback.message.answer("❌ Bekor qilindi.")
+
+
+# ── Edit existing sub-admin permissions ─────────────────────────
+@dp.callback_query(F.data.startswith("subadmEdit:"))
+async def subadm_edit(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != OWNER_ID:
+        return await callback.answer("❌ Ruxsat yo'q", show_alert=True)
+    target_uid = int(callback.data.split(":")[1])
+    row = get_sub_admin(target_uid)
+    if not row:
+        return await callback.answer("❌ Topilmadi", show_alert=True)
+    try:
+        current_perms = json.loads(row["perms"])
+    except Exception:
+        current_perms = []
+
+    await state.set_state(SubAdminStates.choosing_perms)
+    await state.update_data(
+        target_uid=target_uid,
+        current_perms=current_perms,
+        target_username=row.get("username")
+    )
+    uname_str = f"@{row['username']}" if row.get("username") else f"ID:{target_uid}"
+    await callback.answer()
+    try:
+        await callback.message.edit_text(
+            f"✏️ <b>Ruxsatlarni o'zgartirish: {uname_str}</b>\n\n"
+            f"Ruxsatlarni yoqing yoki o'chiring, so'ng 💾 Saqlash.",
+            reply_markup=perm_toggle_kb(target_uid, current_perms),
+            parse_mode="HTML"
+        )
+    except Exception:
+        await callback.message.answer(
+            f"✏️ Ruxsatlarni o'zgartirish: {uname_str}",
+            reply_markup=perm_toggle_kb(target_uid, current_perms),
+            parse_mode="HTML"
+        )
+
+
+# ── Delete a sub-admin ───────────────────────────────────────────
+@dp.callback_query(F.data.startswith("subadmDel:"))
+async def subadm_delete(callback: types.CallbackQuery):
+    if callback.from_user.id != OWNER_ID:
+        return await callback.answer("❌ Ruxsat yo'q", show_alert=True)
+    target_uid = int(callback.data.split(":")[1])
+    row = get_sub_admin(target_uid)
+    if not row:
+        return await callback.answer("❌ Topilmadi", show_alert=True)
+
+    try:
+        db = get_db()
+        try:
+            with db.cursor() as c:
+                c.execute("DELETE FROM admins WHERE user_id=%s", (target_uid,))
+        finally:
+            db.close()
+    except Exception as e:
+        print(f"[SUBADM DELETE ERROR] {e}")
+        return await callback.answer("❌ DB xato", show_alert=True)
+
+    uname_str = f"@{row['username']}" if row.get("username") else f"ID:{target_uid}"
+    await callback.answer(f"✅ {uname_str} o'chirildi")
+
+    # Notify removed admin
+    try:
+        await bot.send_message(target_uid, "⚠️ Sizning admin huquqlaringiz bekor qilindi.")
+    except Exception:
+        pass
+
+    # Refresh sub-admins list
+    admins = all_sub_admins()
+    text   = (
+        f"🛡 <b>SUB-ADMINLAR</b>\n\n"
+        f"Jami: <b>{len(admins)}</b> ta sub-admin\n\n"
+        + (
+            "\n".join(
+                f"• {'@'+a['username'] if a.get('username') else 'ID:'+str(a['user_id'])}  "
+                f"({len(json.loads(a['perms']))} ruxsat)"
+                for a in admins
+            ) if admins else "Hozircha sub-admin yo'q."
+        )
+    )
+    try:
+        await callback.message.edit_text(text, reply_markup=subadmins_list_kb(admins), parse_mode="HTML")
+    except Exception:
+        await callback.message.answer(text, reply_markup=subadmins_list_kb(admins), parse_mode="HTML")
+
 
 # ================================================================
-# NEW: /listusers COMMAND + adm:listusers CALLBACK
+# ═════════════════  LISTUSERS  ══════════════════════════════════
 # ================================================================
+
 @dp.message(Command("listusers"))
 @dp.callback_query(F.data == "adm:listusers")
 async def listusers_cmd(event: types.Message | types.CallbackQuery):
     uid = event.from_user.id
-    if uid not in ADMIN_IDS:
+    if not has_perm(uid, "listusers"):
         if isinstance(event, types.CallbackQuery):
             return await event.answer("❌ Ruxsat yo'q", show_alert=True)
         return
 
-    # Determine reply target
     if isinstance(event, types.CallbackQuery):
         await event.answer()
         target = event.message
     else:
         target = event
 
-    # Fetch all users
     try:
         db = get_db()
         try:
             with db.cursor() as c:
-                c.execute(
-                    "SELECT user_id, username, access_until, created_at "
-                    "FROM users ORDER BY created_at DESC"
-                )
+                c.execute("SELECT user_id, username, access_until, created_at FROM users ORDER BY created_at DESC")
                 rows = c.fetchall()
         finally:
             db.close()
     except Exception as e:
         print(f"[LISTUSERS DB ERROR] {e}")
-        return await target.answer("❌ DB xato. Qaytadan urinib ko'ring.")
+        return await target.answer("❌ DB xato.")
 
     if not rows:
         return await target.answer("❌ Hech qanday foydalanuvchi yo'q.")
@@ -475,43 +891,36 @@ async def listusers_cmd(event: types.Message | types.CallbackQuery):
     now         = datetime.now()
     total       = len(rows)
     premium_cnt = sum(1 for r in rows if r.get("access_until") and r["access_until"] > now)
-    regular_cnt = total - premium_cnt
 
-    # Send text summary first
     await target.answer(
         f"👥 <b>FOYDALANUVCHILAR RO'YXATI</b>\n\n"
-        f"📊 Jami:    <b>{total}</b> ta\n"
-        f"✅ Premium: <b>{premium_cnt}</b> ta\n"
-        f"👤 Oddiy:   <b>{regular_cnt}</b> ta\n\n"
-        f"⏳ Excel fayl tayyorlanmoqda...",
+        f"📊 Jami: <b>{total}</b> | ✅ Premium: <b>{premium_cnt}</b> | 👤 Oddiy: <b>{total-premium_cnt}</b>\n\n"
+        f"⏳ Excel tayyorlanmoqda...",
         parse_mode="HTML"
     )
-
-    # Build and send the Excel file
     try:
         excel_bytes = build_users_excel(rows)
         filename    = f"users_{now.strftime('%Y%m%d_%H%M')}.xlsx"
-
         await target.answer_document(
             BufferedInputFile(excel_bytes, filename=filename),
             caption=(
                 f"📊 <b>Foydalanuvchilar ro'yxati</b>\n"
-                f"👥 Jami: {total} | ✅ Premium: {premium_cnt} | 👤 Oddiy: {regular_cnt}\n"
-                f"📅 {now.strftime('%d.%m.%Y %H:%M')}"
+                f"👥 {total} | ✅ {premium_cnt} | 📅 {now.strftime('%d.%m.%Y %H:%M')}"
             ),
             parse_mode="HTML"
         )
     except Exception as e:
-        print(f"[LISTUSERS EXCEL ERROR] {e}")
-        await target.answer(f"❌ Excel yaratishda xato: {e}")
+        await target.answer(f"❌ Excel xato: {e}")
 
 
-# ================= START =================
+# ================================================================
+# ═════════════════  START  ══════════════════════════════════════
+# ================================================================
+
 @dp.message(CommandStart())
 async def start(message: types.Message, state: FSMContext):
     uid      = message.from_user.id
     username = message.from_user.username or ""
-
     try:
         db = get_db()
         try:
@@ -523,10 +932,9 @@ async def start(message: types.Message, state: FSMContext):
                     (uid, username, datetime.now())
                 )
             if not existing:
-                admin_id = next(iter(ADMIN_IDS))
                 try:
                     await bot.send_message(
-                        admin_id,
+                        OWNER_ID,
                         f"🆕 <b>YANGI FOYDALANUVCHI</b>\n"
                         f"👤 @{username or '—'} (ID: <code>{uid}</code>)\n"
                         f"📅 {datetime.now().strftime('%d.%m.%Y %H:%M')}",
@@ -538,9 +946,9 @@ async def start(message: types.Message, state: FSMContext):
             db.close()
     except Exception as e:
         print(f"[START DB ERROR] {e}")
-
     await state.clear()
     await message.answer("👋 Xush kelibsiz!", reply_markup=get_menu(uid))
+
 
 # ================= RESET / CANCEL =================
 @dp.message(F.text == "🔄 Tozalash")
@@ -559,6 +967,7 @@ async def cancel_any(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("❌ Bekor qilindi", reply_markup=get_menu(message.from_user.id))
 
+
 # ================= PDF =================
 @dp.message(F.text == "📄 PDF yaratish")
 async def pdf_start(message: types.Message, state: FSMContext):
@@ -568,15 +977,13 @@ async def pdf_start(message: types.Message, state: FSMContext):
         images = data.get("images", [])
         if images:
             return await message.answer(
-                f"📸 {len(images)} ta rasm bor.\n"
-                f"Yana rasm yuboring yoki '📥 PDF yaratish' ni bosing.",
+                f"📸 {len(images)} ta rasm bor.\nYana rasm yuboring yoki '📥 PDF yaratish' ni bosing.",
                 reply_markup=menu_pdf_collecting(len(images))
             )
     await state.set_state(PDFStates.collecting_images)
     await state.update_data(images=[])
     await message.answer(
-        "📸 Rasmlarni yuboring.\n"
-        "Hammasi tayyor bo'lgach '📥 PDF yaratish' tugmasini bosing.",
+        "📸 Rasmlarni yuboring.\nHammasi tayyor bo'lgach '📥 PDF yaratish' tugmasini bosing.",
         reply_markup=menu_pdf_collecting(0)
     )
 
@@ -591,8 +998,7 @@ async def pdf_add_image(message: types.Message, state: FSMContext):
     images.append(path)
     await state.update_data(images=images)
     await message.answer(
-        f"✅ Rasm qo'shildi! Jami: {len(images)} ta\n"
-        f"Yana rasm yuboring yoki '📥 PDF yaratish' ni bosing.",
+        f"✅ Rasm qo'shildi! Jami: {len(images)} ta\nYana rasm yuboring yoki '📥 PDF yaratish' ni bosing.",
         reply_markup=menu_pdf_collecting(len(images))
     )
 
@@ -601,15 +1007,9 @@ async def pdf_ask_name(message: types.Message, state: FSMContext):
     data   = await state.get_data()
     images = data.get("images", [])
     if not images:
-        return await message.answer(
-            "❌ Hali rasm yuborilmagan. Avval rasmlarni yuboring.",
-            reply_markup=menu_pdf_collecting(0)
-        )
+        return await message.answer("❌ Hali rasm yuborilmagan.", reply_markup=menu_pdf_collecting(0))
     await state.set_state(PDFStates.waiting_pdf_name)
-    await message.answer(
-        f"✅ {len(images)} ta rasm tayyor.\n\n📝 PDF uchun nom kiriting:",
-        reply_markup=kb_cancel()
-    )
+    await message.answer(f"✅ {len(images)} ta rasm tayyor.\n\n📝 PDF uchun nom kiriting:", reply_markup=kb_cancel())
 
 @dp.message(PDFStates.waiting_pdf_name, F.text)
 async def pdf_create(message: types.Message, state: FSMContext):
@@ -618,35 +1018,27 @@ async def pdf_create(message: types.Message, state: FSMContext):
     pdf_path = None
     if not images:
         await state.clear()
-        return await message.answer("❌ Rasm topilmadi. Qaytadan boshlang.", reply_markup=get_menu(message.from_user.id))
+        return await message.answer("❌ Rasm topilmadi.", reply_markup=get_menu(message.from_user.id))
     safe_name = sanitize_filename(message.text)
     pdf_path  = f"/tmp/{safe_name}_{uuid.uuid4().hex}.pdf"
     await message.answer("⏳ PDF yaratilmoqda...")
     try:
-        pil_images = []
-        for p in images:
-            img = Image.open(p).convert("RGB")
-            pil_images.append(img)
+        pil_images = [Image.open(p).convert("RGB") for p in images]
         pil_images[0].save(pdf_path, save_all=True, append_images=pil_images[1:])
-        for img in pil_images:
-            img.close()
-        await message.answer_document(
-            FSInputFile(pdf_path, filename=f"{safe_name}.pdf"),
-            caption=f"✅ PDF tayyor! ({len(images)} ta rasm)"
-        )
+        for img in pil_images: img.close()
+        await message.answer_document(FSInputFile(pdf_path, filename=f"{safe_name}.pdf"), caption=f"✅ PDF tayyor! ({len(images)} ta rasm)")
     except Exception as e:
-        await message.answer(f"❌ Xato yuz berdi: {e}")
+        await message.answer(f"❌ Xato: {e}")
     finally:
         cleanup_files(*images, pdf_path)
         await state.clear()
     await message.answer("✅ Bajarildi!", reply_markup=get_menu(message.from_user.id))
 
+
 # ================= PAYMENT =================
 @dp.message(F.text == "💳 To'lov qilish")
 async def payment_info(message: types.Message):
-    txt = "💳 Tariflar:\n\n"
-    for v in TARIFFS.values():
-        txt += f"• {v}\n"
+    txt = "💳 Tariflar:\n\n" + "".join(f"• {v}\n" for v in TARIFFS.values())
     txt += f"\n👉 To'lov:\n{PAYNET_LINK},\n yoki Karta:\n 9860350147430564"
     await message.answer(txt)
 
@@ -663,17 +1055,13 @@ async def receive_check(message: types.Message, state: FSMContext):
         db = get_db()
         try:
             with db.cursor() as c:
-                c.execute(
-                    "INSERT INTO payments (user_id, status, created_at) VALUES (%s, 'pending', %s)",
-                    (uid, datetime.now())
-                )
+                c.execute("INSERT INTO payments (user_id, status, created_at) VALUES (%s, 'pending', %s)", (uid, datetime.now()))
                 payment_id = c.lastrowid
         finally:
             db.close()
     except Exception as e:
         print(f"[PAYMENT INSERT ERROR] {e}")
-        await message.answer("❌ Xato yuz berdi. Qaytadan urinib ko'ring.")
-        return
+        return await message.answer("❌ Xato yuz berdi.")
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -685,27 +1073,28 @@ async def receive_check(message: types.Message, state: FSMContext):
     ])
     username = message.from_user.username or "—"
     caption  = (
-        f"🧾 <b>TO'LOV CHEKI</b>\n"
-        f"👤 @{username} (ID: <code>{uid}</code>)\n"
-        f"🆔 Payment ID: {payment_id}\n"
-        f"📅 {datetime.now().strftime('%d.%m.%Y %H:%M')}"
+        f"🧾 <b>TO'LOV CHEKI</b>\n👤 @{username} (ID: <code>{uid}</code>)\n"
+        f"🆔 Payment ID: {payment_id}\n📅 {datetime.now().strftime('%d.%m.%Y %H:%M')}"
     )
-    admin_id = next(iter(ADMIN_IDS))
-    try:
-        if message.photo:
-            await bot.send_photo(admin_id, message.photo[-1].file_id, caption=caption, reply_markup=kb, parse_mode="HTML")
-        else:
-            await bot.send_document(admin_id, message.document.file_id, caption=caption, reply_markup=kb, parse_mode="HTML")
-    except Exception as e:
-        print(f"[ADMIN SEND ERROR] {e}")
-        await message.answer("❌ Chekni adminga yuborishda xato. Qaytadan urinib ko'ring.")
-        return
+
+    # Send to owner AND all sub-admins with payments permission
+    targets = [OWNER_ID] + [a["user_id"] for a in all_sub_admins() if "payments" in json.loads(a.get("perms","[]"))]
+    for admin_target in targets:
+        try:
+            if message.photo:
+                await bot.send_photo(admin_target, message.photo[-1].file_id, caption=caption, reply_markup=kb, parse_mode="HTML")
+            else:
+                await bot.send_document(admin_target, message.document.file_id, caption=caption, reply_markup=kb, parse_mode="HTML")
+        except Exception as e:
+            print(f"[ADMIN SEND ERROR uid={admin_target}] {e}")
+
     await message.answer("⏳ Chek yuborildi. 24 soat ichida javob beriladi.")
+
 
 # ================= APPROVE / REJECT PAYMENT =================
 @dp.callback_query(F.data.startswith("pApprove:"))
 async def approve_payment(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMIN_IDS:
+    if not has_perm(callback.from_user.id, "payments"):
         return await callback.answer("❌ Ruxsat yo'q", show_alert=True)
     try:
         _, payment_id, uid, days = callback.data.split(":")
@@ -721,11 +1110,7 @@ async def approve_payment(callback: types.CallbackQuery):
                     return await callback.answer("❌ Payment topilmadi", show_alert=True)
             with db.cursor() as c:
                 c.execute(
-                    """UPDATE users
-                       SET access_until = GREATEST(COALESCE(access_until, NOW()), NOW())
-                                          + INTERVAL %s DAY,
-                           warned = 0
-                       WHERE user_id = %s""",
+                    "UPDATE users SET access_until = GREATEST(COALESCE(access_until,NOW()),NOW()) + INTERVAL %s DAY, warned=0 WHERE user_id=%s",
                     (days, uid)
                 )
             with db.cursor() as c:
@@ -736,11 +1121,7 @@ async def approve_payment(callback: types.CallbackQuery):
         print(f"[APPROVE PAYMENT ERROR] {e}")
         return await callback.answer("❌ DB xato", show_alert=True)
     try:
-        await bot.send_message(
-            uid,
-            f"🎉 Premium <b>{days} kun</b> faollashtirildi!\n📅 {datetime.now().strftime('%d.%m.%Y')}",
-            reply_markup=menu_premium, parse_mode="HTML"
-        )
+        await bot.send_message(uid, f"🎉 Premium <b>{days} kun</b> faollashtirildi!\n📅 {datetime.now().strftime('%d.%m.%Y')}", reply_markup=menu_premium, parse_mode="HTML")
     except Exception as e:
         print(f"[SEND ERROR uid={uid}] {e}")
     try:
@@ -752,7 +1133,7 @@ async def approve_payment(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("pReject:"))
 async def reject_payment(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMIN_IDS:
+    if not has_perm(callback.from_user.id, "payments"):
         return await callback.answer("❌ Ruxsat yo'q", show_alert=True)
     try:
         _, payment_id, uid = callback.data.split(":")
@@ -774,7 +1155,7 @@ async def reject_payment(callback: types.CallbackQuery):
         print(f"[REJECT PAYMENT ERROR] {e}")
         return await callback.answer("❌ DB xato", show_alert=True)
     try:
-        await bot.send_message(uid, "❌ To'lovingiz tasdiqlanmadi.\nChekni qayta tekshirib yuboring yoki admin bilan bog'laning.")
+        await bot.send_message(uid, "❌ To'lovingiz tasdiqlanmadi.\nChekni qayta tekshirib yuboring.")
     except Exception as e:
         print(f"[SEND ERROR uid={uid}] {e}")
     try:
@@ -784,38 +1165,30 @@ async def reject_payment(callback: types.CallbackQuery):
         pass
     await callback.answer("❌ Rad etildi")
 
+
 # ================= ORDER FLOW =================
 async def start_order(message: types.Message, state: FSMContext, order_type: str):
     uid = message.from_user.id
     if not has_access(uid):
-        return await message.answer(
-            "❌ Bu funksiya faqat premium foydalanuvchilar uchun.\n💳 To'lov qilish tugmasini bosing.",
-            reply_markup=get_menu(uid)
-        )
+        return await message.answer("❌ Bu funksiya faqat premium foydalanuvchilar uchun.\n💳 To'lov qilish tugmasini bosing.", reply_markup=get_menu(uid))
     active = get_active_order(uid)
     if active:
         type_name = ORDER_TYPES.get(active["type"], active["type"])
         return await message.answer(
-            f"⚠️ Sizda hali bajarilmagan buyurtma bor:\n"
-            f"🆔 #{active['id']} | {type_name}\n"
-            f"📚 {active['subject']} — {active['topic']}\n"
-            f"⏳ Holati: {active['status']}\n\n"
+            f"⚠️ Sizda hali bajarilmagan buyurtma bor:\n🆔 #{active['id']} | {type_name}\n"
+            f"📚 {active['subject']} — {active['topic']}\n⏳ Holati: {active['status']}\n\n"
             f"Yangi buyurtma berish uchun avvalgi buyurtma tugashini kuting.",
             reply_markup=get_menu(uid)
         )
     used = get_order_monthly_count(uid)
     if used >= ORDER_LIMIT_PER_MONTH:
-        return await message.answer(
-            f"⚠️ Siz bu oy {ORDER_LIMIT_PER_MONTH} ta buyurtma limitidan foydalandingiz.\nKeyingi oy yangilanadi.",
-            reply_markup=get_menu(uid)
-        )
+        return await message.answer(f"⚠️ Siz bu oy {ORDER_LIMIT_PER_MONTH} ta buyurtma limitidan foydalandingiz.\nKeyingi oy yangilanadi.", reply_markup=get_menu(uid))
     remaining  = ORDER_LIMIT_PER_MONTH - used
     type_label = ORDER_TYPES.get(order_type, order_type)
     await state.set_state(OrderStates.entering_subject)
     await state.update_data(order_type=order_type)
     await message.answer(
-        f"{type_label} buyurtmasi\n"
-        f"📊 Bu oy: {used}/{ORDER_LIMIT_PER_MONTH} (qoldi: {remaining})\n\n"
+        f"{type_label} buyurtmasi\n📊 Bu oy: {used}/{ORDER_LIMIT_PER_MONTH} (qoldi: {remaining})\n\n"
         f"📚 Fan nomini kiriting:\n<i>Masalan: Matematika, Fizika, Tarix...</i>",
         reply_markup=kb_cancel(), parse_mode="HTML"
     )
@@ -832,77 +1205,61 @@ async def order_mustaqil(message: types.Message, state: FSMContext):
 async def order_subject(message: types.Message, state: FSMContext):
     subject = message.text.strip()
     if len(subject) < 2 or len(subject) > 100:
-        return await message.answer("❌ Fan nomi 2-100 ta belgi bo'lishi kerak. Qaytadan kiriting:")
+        return await message.answer("❌ Fan nomi 2-100 ta belgi bo'lishi kerak.")
     await state.update_data(subject=subject)
     await state.set_state(OrderStates.entering_topic)
-    await message.answer(
-        f"✅ Fan: <b>{subject}</b>\n\n📝 Mavzuni kiriting:\n<i>Masalan: Ikkinchi jahon urushi sabablari</i>",
-        parse_mode="HTML"
-    )
+    await message.answer(f"✅ Fan: <b>{subject}</b>\n\n📝 Mavzuni kiriting:\n<i>Masalan: Ikkinchi jahon urushi sabablari</i>", parse_mode="HTML")
 
 @dp.message(OrderStates.entering_topic)
 async def order_topic(message: types.Message, state: FSMContext):
     topic = message.text.strip()
     if len(topic) < 3 or len(topic) > 200:
-        return await message.answer("❌ Mavzu 3-200 ta belgi bo'lishi kerak. Qaytadan kiriting:")
+        return await message.answer("❌ Mavzu 3-200 ta belgi bo'lishi kerak.")
     await state.update_data(topic=topic)
     await state.set_state(OrderStates.choosing_pages)
-    await message.answer(
-        f"✅ Mavzu: <b>{topic}</b>\n\n📄 Necha sahifa kerak? (maksimal 25)",
-        reply_markup=kb_pages(), parse_mode="HTML"
-    )
+    await message.answer(f"✅ Mavzu: <b>{topic}</b>\n\n📄 Necha sahifa kerak? (maksimal 25)", reply_markup=kb_pages(), parse_mode="HTML")
 
 @dp.message(OrderStates.choosing_pages)
 async def order_pages(message: types.Message, state: FSMContext):
     text = message.text.strip()
     if not text.isdigit() or not (1 <= int(text) <= 25):
-        return await message.answer("❌ Iltimos, 1-25 orasida son kiriting yoki tugmalardan birini tanlang:")
+        return await message.answer("❌ 1-25 orasida son kiriting:")
     await state.update_data(pages=int(text))
     await state.set_state(OrderStates.choosing_filetype)
-    await message.answer(
-        f"✅ Sahifalar: <b>{text}</b>\n\n📁 Fayl turini tanlang:",
-        reply_markup=kb_filetype(), parse_mode="HTML"
-    )
+    await message.answer(f"✅ Sahifalar: <b>{text}</b>\n\n📁 Fayl turini tanlang:", reply_markup=kb_filetype(), parse_mode="HTML")
 
 @dp.message(OrderStates.choosing_filetype)
 async def order_filetype(message: types.Message, state: FSMContext):
     filetype = message.text.strip()
     if filetype not in FILETYPE_LABELS:
-        return await message.answer("❌ Iltimos, quyidagi tugmalardan birini tanlang:")
+        return await message.answer("❌ Tugmalardan birini tanlang:")
     await state.update_data(filetype=filetype)
     await state.set_state(OrderStates.choosing_deadline)
-    await message.answer(
-        f"✅ Fayl turi: <b>{filetype}</b>\n\n⏰ Qachon tayyor bo'lishi kerak?",
-        reply_markup=kb_deadline(), parse_mode="HTML"
-    )
+    await message.answer(f"✅ Fayl turi: <b>{filetype}</b>\n\n⏰ Qachon tayyor bo'lishi kerak?", reply_markup=kb_deadline(), parse_mode="HTML")
 
 @dp.message(OrderStates.choosing_deadline)
 async def order_deadline(message: types.Message, state: FSMContext):
     deadline = message.text.strip()
     if deadline not in DEADLINE_OPTIONS:
-        return await message.answer("❌ Iltimos, quyidagi tugmalardan birini tanlang:")
+        return await message.answer("❌ Tugmalardan birini tanlang:")
     await state.update_data(deadline=deadline)
     await state.set_state(OrderStates.confirming)
     data          = await state.get_data()
     type_name     = ORDER_TYPES.get(data["order_type"], data["order_type"])
-    deadline_days = int(deadline.split()[0])
-    deadline_date = datetime.now() + timedelta(days=deadline_days)
+    deadline_date = datetime.now() + timedelta(days=int(deadline.split()[0]))
     summary = (
-        f"📋 BUYURTMA MA'LUMOTLARI\n{'─' * 25}\n"
-        f"📌 Tur:       {type_name}\n"
-        f"📚 Fan:       {data['subject']}\n"
-        f"📝 Mavzu:     {data['topic']}\n"
-        f"📄 Sahifa:    {data['pages']}\n"
-        f"📁 Fayl turi: {data['filetype']}\n"
-        f"⏰ Muddat:    {deadline_date.strftime('%d.%m.%Y')} ({deadline})\n"
-        f"{'─' * 25}\n\n✅ Tasdiqlaysizmi?"
+        f"📋 BUYURTMA MA'LUMOTLARI\n{'─'*25}\n"
+        f"📌 Tur:       {type_name}\n📚 Fan:       {data['subject']}\n"
+        f"📝 Mavzu:     {data['topic']}\n📄 Sahifa:    {data['pages']}\n"
+        f"📁 Fayl turi: {data['filetype']}\n⏰ Muddat:    {deadline_date.strftime('%d.%m.%Y')} ({deadline})\n"
+        f"{'─'*25}\n\n✅ Tasdiqlaysizmi?"
     )
     await message.answer(summary, reply_markup=kb_confirm())
 
 @dp.message(OrderStates.confirming, F.text == "✅ Tasdiqlash")
 async def order_confirm(message: types.Message, state: FSMContext):
-    uid          = message.from_user.id
-    data         = await state.get_data()
+    uid           = message.from_user.id
+    data          = await state.get_data()
     deadline_str  = data["deadline"]
     deadline_date = deadline_str_to_date(deadline_str)
     filetype      = data.get("filetype", "📄 PDF")
@@ -911,50 +1268,46 @@ async def order_confirm(message: types.Message, state: FSMContext):
         try:
             with db.cursor() as c:
                 c.execute(
-                    """INSERT INTO orders
-                       (user_id, type, subject, topic, pages, filetype, deadline, status, created_at)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending', %s)""",
-                    (uid, data["order_type"], data["subject"], data["topic"],
-                     data["pages"], filetype, deadline_date, datetime.now())
+                    "INSERT INTO orders (user_id, type, subject, topic, pages, filetype, deadline, status, created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,'pending',%s)",
+                    (uid, data["order_type"], data["subject"], data["topic"], data["pages"], filetype, deadline_date, datetime.now())
                 )
                 order_id = c.lastrowid
         finally:
             db.close()
     except Exception as e:
         print(f"[ORDER INSERT ERROR] {e}")
-        await message.answer("❌ Buyurtmani saqlashda xato. Qaytadan urinib ko'ring.")
-        return
+        return await message.answer("❌ Buyurtmani saqlashda xato.")
     await state.clear()
     type_name = ORDER_TYPES.get(data["order_type"], data["order_type"])
     await message.answer(
-        f"✅ Buyurtma qabul qilindi!\n🆔 Buyurtma raqami: #{order_id}\n"
-        f"📁 Fayl turi: {filetype}\n⏰ Muddat: {deadline_date}\n"
-        f"⏳ Admin ko'rib chiqadi va tez orada javob beradi.",
+        f"✅ Buyurtma qabul qilindi!\n🆔 #{order_id}\n📁 {filetype}\n⏰ {deadline_date}\n⏳ Admin ko'rib chiqadi.",
         reply_markup=get_menu(uid)
     )
     username  = message.from_user.username or "—"
     admin_txt = (
-        f"🆕 <b>YANGI BUYURTMA #{order_id}</b>\n{'─' * 25}\n"
+        f"🆕 <b>YANGI BUYURTMA #{order_id}</b>\n{'─'*25}\n"
         f"👤 @{username} (ID: <code>{uid}</code>)\n"
-        f"📌 Tur:       {type_name}\n📚 Fan:       {data['subject']}\n"
-        f"📝 Mavzu:     {data['topic']}\n📄 Sahifa:    {data['pages']}\n"
-        f"📁 Fayl turi: {filetype}\n⏰ Muddat:    {deadline_date} ({deadline_str})\n"
-        f"📅 Vaqt:      {datetime.now().strftime('%d.%m.%Y %H:%M')}"
+        f"📌 {type_name}\n📚 {data['subject']}\n📝 {data['topic']}\n"
+        f"📄 {data['pages']} sahifa\n📁 {filetype}\n⏰ {deadline_date} ({deadline_str})\n"
+        f"📅 {datetime.now().strftime('%d.%m.%Y %H:%M')}"
     )
     admin_kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✅ Qabul qilish", callback_data=f"oAccept:{order_id}:{uid}"),
         InlineKeyboardButton(text="❌ Rad etish",    callback_data=f"oReject:{order_id}:{uid}")
     ]])
-    admin_id = next(iter(ADMIN_IDS))
-    try:
-        await bot.send_message(admin_id, admin_txt, reply_markup=admin_kb, parse_mode="HTML")
-    except Exception as e:
-        print(f"[ADMIN ORDER NOTIFY ERROR] {e}")
+    # Notify owner + order-capable sub-admins
+    targets = [OWNER_ID] + [a["user_id"] for a in all_sub_admins() if "orders" in json.loads(a.get("perms","[]"))]
+    for t in targets:
+        try:
+            await bot.send_message(t, admin_txt, reply_markup=admin_kb, parse_mode="HTML")
+        except Exception as e:
+            print(f"[ORDER NOTIFY ERROR uid={t}] {e}")
+
 
 # ================= ADMIN ORDER CALLBACKS =================
 @dp.callback_query(F.data.startswith("oAccept:"))
 async def order_accept(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMIN_IDS:
+    if not has_perm(callback.from_user.id, "orders"):
         return await callback.answer("❌ Ruxsat yo'q", show_alert=True)
     try:
         _, order_id, uid = callback.data.split(":")
@@ -972,7 +1325,7 @@ async def order_accept(callback: types.CallbackQuery):
         print(f"[ORDER ACCEPT ERROR] {e}")
         return await callback.answer("❌ DB xato", show_alert=True)
     try:
-        await bot.send_message(uid, f"✅ Buyurtmangiz #{order_id} qabul qilindi!\n⏳ Ish boshlanmoqda. Tayyor bo'lganda sizga yuboriladi.")
+        await bot.send_message(uid, f"✅ Buyurtmangiz #{order_id} qabul qilindi!\n⏳ Tayyor bo'lganda yuboriladi.")
     except Exception as e:
         print(f"[SEND ERROR uid={uid}] {e}")
     try:
@@ -987,7 +1340,7 @@ async def order_accept(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("oReject:"))
 async def order_reject_cb(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMIN_IDS:
+    if not has_perm(callback.from_user.id, "orders"):
         return await callback.answer("❌ Ruxsat yo'q", show_alert=True)
     try:
         _, order_id, uid = callback.data.split(":")
@@ -1005,7 +1358,7 @@ async def order_reject_cb(callback: types.CallbackQuery):
         print(f"[ORDER REJECT ERROR] {e}")
         return await callback.answer("❌ DB xato", show_alert=True)
     try:
-        await bot.send_message(uid, f"❌ Buyurtmangiz #{order_id} rad etildi.\nIltimos, mavzuni o'zgartiring yoki admin bilan bog'laning.")
+        await bot.send_message(uid, f"❌ Buyurtmangiz #{order_id} rad etildi.")
     except Exception as e:
         print(f"[SEND ERROR uid={uid}] {e}")
     try:
@@ -1015,10 +1368,11 @@ async def order_reject_cb(callback: types.CallbackQuery):
         pass
     await callback.answer("❌ Rad etildi")
 
+
 # ================= DELIVER — FAYL =================
 @dp.message(Command("deliver"))
 async def deliver_file_cmd(message: types.Message, state: FSMContext):
-    if message.from_user.id not in ADMIN_IDS:
+    if not has_perm(message.from_user.id, "orders"):
         return
     args = message.text.split()
     if len(args) < 2 or not args[1].isdigit():
@@ -1033,18 +1387,16 @@ async def deliver_file_cmd(message: types.Message, state: FSMContext):
         finally:
             db.close()
     except Exception as e:
-        print(f"[DELIVER CMD ERROR] {e}")
         return await message.answer("❌ DB xato")
     if not order:
-        return await message.answer(f"❌ #{order_id} buyurtma topilmadi")
+        return await message.answer(f"❌ #{order_id} topilmadi")
     if order["status"] == "done":
         return await message.answer(f"⚠️ #{order_id} allaqachon bajarilgan")
     type_name = ORDER_TYPES.get(order["type"], order["type"])
     await state.set_state(DeliverStates.waiting_file)
     await state.update_data(order_id=order_id, target_uid=order["user_id"])
     await message.answer(
-        f"📤 #{order_id} uchun fayl yuboring:\n👤 User ID: {order['user_id']}\n"
-        f"📌 {type_name} | {order['subject']} — {order['topic']}\n\nFayl (PDF, DOCX, XLSX...) yuboring:",
+        f"📤 #{order_id} uchun fayl yuboring:\n👤 {order['user_id']}\n📌 {type_name} | {order['subject']} — {order['topic']}\n\nFayl yuboring:",
         reply_markup=kb_cancel()
     )
 
@@ -1064,7 +1416,6 @@ async def deliver_file_send(message: types.Message, state: FSMContext):
         finally:
             db.close()
     except Exception as e:
-        print(f"[DELIVER FILE SEND ERROR] {e}")
         await message.answer("❌ DB xato")
         await state.clear()
         return
@@ -1072,15 +1423,16 @@ async def deliver_file_send(message: types.Message, state: FSMContext):
     caption   = f"✅ Buyurtmangiz tayyor!\n🆔 #{order_id} | {type_name}\n📚 {order['subject']} — {order['topic']}"
     try:
         await bot.send_document(target_uid, message.document.file_id, caption=caption)
-        await message.answer(f"✅ Fayl user {target_uid} ga yuborildi (#{order_id})", reply_markup=get_menu(message.from_user.id))
+        await message.answer(f"✅ Fayl yuborildi (#{order_id})", reply_markup=get_menu(message.from_user.id))
     except Exception as e:
-        await message.answer(f"❌ Yuborishda xato: {e}")
+        await message.answer(f"❌ Xato: {e}")
     await state.clear()
+
 
 # ================= DELIVER — MATN =================
 @dp.message(Command("delivertext"))
 async def deliver_text_cmd(message: types.Message, state: FSMContext):
-    if message.from_user.id not in ADMIN_IDS:
+    if not has_perm(message.from_user.id, "orders"):
         return
     args = message.text.split()
     if len(args) < 2 or not args[1].isdigit():
@@ -1095,18 +1447,16 @@ async def deliver_text_cmd(message: types.Message, state: FSMContext):
         finally:
             db.close()
     except Exception as e:
-        print(f"[DELIVERTEXT CMD ERROR] {e}")
         return await message.answer("❌ DB xato")
     if not order:
-        return await message.answer(f"❌ #{order_id} buyurtma topilmadi")
+        return await message.answer(f"❌ #{order_id} topilmadi")
     if order["status"] == "done":
         return await message.answer(f"⚠️ #{order_id} allaqachon bajarilgan")
     type_name = ORDER_TYPES.get(order["type"], order["type"])
     await state.set_state(DeliverStates.waiting_text)
     await state.update_data(order_id=order_id, target_uid=order["user_id"])
     await message.answer(
-        f"✏️ #{order_id} uchun matn yuboring:\n👤 User ID: {order['user_id']}\n"
-        f"📌 {type_name} | {order['subject']} — {order['topic']}\n\nMatnni yozing:",
+        f"✏️ #{order_id} uchun matn yuboring:\n👤 {order['user_id']}\n📌 {type_name} | {order['subject']} — {order['topic']}\n\nMatnni yozing:",
         reply_markup=kb_cancel()
     )
 
@@ -1126,18 +1476,18 @@ async def deliver_text_send(message: types.Message, state: FSMContext):
         finally:
             db.close()
     except Exception as e:
-        print(f"[DELIVER TEXT SEND ERROR] {e}")
         await message.answer("❌ DB xato")
         await state.clear()
         return
     type_name = ORDER_TYPES.get(order["type"], order["type"])
-    header    = f"✅ Buyurtmangiz tayyor!\n🆔 #{order_id} | {type_name}\n📚 {order['subject']} — {order['topic']}\n{'─' * 25}\n\n"
+    header    = f"✅ Buyurtmangiz tayyor!\n🆔 #{order_id} | {type_name}\n📚 {order['subject']} — {order['topic']}\n{'─'*25}\n\n"
     try:
         await bot.send_message(target_uid, header + message.text)
-        await message.answer(f"✅ Matn user {target_uid} ga yuborildi (#{order_id})", reply_markup=get_menu(message.from_user.id))
+        await message.answer(f"✅ Matn yuborildi (#{order_id})", reply_markup=get_menu(message.from_user.id))
     except Exception as e:
-        await message.answer(f"❌ Yuborishda xato: {e}")
+        await message.answer(f"❌ Xato: {e}")
     await state.clear()
+
 
 # ================= MY ORDERS =================
 @dp.message(F.text == "📋 Buyurtmalarim")
@@ -1149,53 +1499,41 @@ async def my_orders(message: types.Message):
         db = get_db()
         try:
             with db.cursor() as c:
-                c.execute(
-                    "SELECT id, type, subject, topic, pages, deadline, status, created_at FROM orders WHERE user_id=%s ORDER BY id DESC LIMIT 10",
-                    (uid,)
-                )
+                c.execute("SELECT id, type, subject, topic, pages, deadline, status, created_at FROM orders WHERE user_id=%s ORDER BY id DESC LIMIT 10", (uid,))
                 rows = c.fetchall()
         finally:
             db.close()
     except Exception as e:
-        print(f"[MY ORDERS ERROR] {e}")
         return await message.answer("❌ Xato yuz berdi.")
     if not rows:
         return await message.answer("📋 Hali buyurtmalar yo'q.")
     used      = get_order_monthly_count(uid)
     remaining = max(0, ORDER_LIMIT_PER_MONTH - used)
-    status_icons = {
-        "pending": "⏳ Kutilmoqda", "in_progress": "🔄 Jarayonda",
-        "done": "✅ Bajarildi",     "rejected": "❌ Rad etildi"
-    }
-    txt = f"📋 BUYURTMALARIM\n📊 Bu oy: {used}/{ORDER_LIMIT_PER_MONTH} (qoldi: {remaining})\n{'─' * 25}\n\n"
+    status_icons = {"pending":"⏳ Kutilmoqda","in_progress":"🔄 Jarayonda","done":"✅ Bajarildi","rejected":"❌ Rad etildi"}
+    txt = f"📋 BUYURTMALARIM\n📊 Bu oy: {used}/{ORDER_LIMIT_PER_MONTH} (qoldi: {remaining})\n{'─'*25}\n\n"
     for r in rows:
-        type_name    = ORDER_TYPES.get(r["type"], r["type"])
-        status_txt   = status_icons.get(r["status"], r["status"])
-        date_str     = r["created_at"].strftime('%d.%m.%Y') if r["created_at"] else "—"
-        deadline_txt = format_deadline(r["deadline"])
         txt += (
-            f"🆔 #{r['id']} | {type_name}\n"
+            f"🆔 #{r['id']} | {ORDER_TYPES.get(r['type'], r['type'])}\n"
             f"📚 {r['subject']} — {r['topic']}\n"
-            f"📄 {r['pages']} sahifa | ⏰ {deadline_txt}\n"
-            f"📅 {date_str} | {status_txt}\n{'─' * 25}\n"
+            f"📄 {r['pages']} sahifa | ⏰ {format_deadline(r['deadline'])}\n"
+            f"📅 {r['created_at'].strftime('%d.%m.%Y') if r['created_at'] else '—'} | {status_icons.get(r['status'], r['status'])}\n{'─'*25}\n"
         )
     if len(txt) > 4000:
         txt = txt[:4000] + "\n..."
     await message.answer(txt)
+
 
 # ================= BROADCAST =================
 @dp.message(Command("broadcast"))
 @dp.callback_query(F.data == "adm:broadcast")
 async def broadcast_cmd(event: types.Message | types.CallbackQuery, state: FSMContext):
     uid = event.from_user.id
-    if uid not in ADMIN_IDS:
+    if not has_perm(uid, "broadcast"):
+        if isinstance(event, types.CallbackQuery):
+            return await event.answer("❌ Ruxsat yo'q", show_alert=True)
         return
     await state.set_state(BroadcastStates.waiting_message)
-    text = (
-        "📢 <b>BROADCAST</b>\n\nXabar yuboring — har qanday turdagi:\n"
-        "• Matn\n• Rasm (caption bilan yoki siz)\n• Fayl / hujjat\n• Video\n• Forward qilingan xabar\n\n"
-        "<i>❌ Bekor qilish — buyrug'ini yozish uchun</i>"
-    )
+    text = "📢 <b>BROADCAST</b>\n\nXabar yuboring — har qanday turdagi:\n• Matn\n• Rasm\n• Fayl\n• Video\n• Forward\n\n<i>❌ Bekor qilish</i>"
     if isinstance(event, types.CallbackQuery):
         await event.answer()
         await event.message.answer(text, reply_markup=kb_cancel(), parse_mode="HTML")
@@ -1204,8 +1542,7 @@ async def broadcast_cmd(event: types.Message | types.CallbackQuery, state: FSMCo
 
 @dp.message(BroadcastStates.waiting_message)
 async def broadcast_preview(message: types.Message, state: FSMContext):
-    if message.forward_from or message.forward_from_chat:
-        msg_type = "forward"
+    if message.forward_from or message.forward_from_chat: msg_type = "forward"
     elif message.photo:    msg_type = "photo"
     elif message.video:    msg_type = "video"
     elif message.document: msg_type = "document"
@@ -1219,14 +1556,13 @@ async def broadcast_preview(message: types.Message, state: FSMContext):
     user_count = len(get_all_user_ids())
     await state.set_state(BroadcastStates.confirming)
     await message.answer(
-        f"📢 <b>BROADCAST PREVIEW</b>\n\n👥 Yuboriladi: <b>{user_count} ta</b> foydalanuvchiga\n"
-        f"📨 Xabar turi: <b>{msg_type}</b>\n\nYuborishni tasdiqlaysizmi?",
+        f"📢 <b>BROADCAST PREVIEW</b>\n\n👥 Yuboriladi: <b>{user_count} ta</b>\n📨 Tur: <b>{msg_type}</b>\n\nTasdiqlaysizmi?",
         reply_markup=kb_broadcast_confirm(), parse_mode="HTML"
     )
 
 @dp.callback_query(F.data == "bc:send")
 async def broadcast_send(callback: types.CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in ADMIN_IDS:
+    if not has_perm(callback.from_user.id, "broadcast"):
         return await callback.answer("❌ Ruxsat yo'q", show_alert=True)
     data     = await state.get_data()
     user_ids = get_all_user_ids()
@@ -1243,13 +1579,13 @@ async def broadcast_send(callback: types.CallbackQuery, state: FSMContext):
             failed += 1
         if i % 20 == 0:
             try:
-                await status_msg.edit_text(f"⏳ Yuborilmoqda... {i}/{len(user_ids)}\n✅ {success} | ❌ {failed}")
+                await status_msg.edit_text(f"⏳ {i}/{len(user_ids)}\n✅ {success} | ❌ {failed}")
             except Exception:
                 pass
         await asyncio.sleep(0.05)
     try:
         await status_msg.edit_text(
-            f"✅ <b>Broadcast yakunlandi!</b>\n\n👥 Jami: {len(user_ids)}\n✅ Yuborildi: {success}\n❌ Xato (bloklagan): {failed}",
+            f"✅ <b>Broadcast yakunlandi!</b>\n\n👥 Jami: {len(user_ids)}\n✅ {success} | ❌ {failed}",
             parse_mode="HTML"
         )
     except Exception:
@@ -1262,26 +1598,25 @@ async def broadcast_cancel(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer("❌ Bekor qilindi")
     await callback.message.reply("❌ Broadcast bekor qilindi.")
 
+
 # ================= REVOKE PREMIUM =================
 @dp.message(Command("revoke"))
 @dp.callback_query(F.data == "adm:revoke")
 async def revoke_cmd(event: types.Message | types.CallbackQuery, state: FSMContext):
     uid = event.from_user.id
-    if uid not in ADMIN_IDS:
+    if not has_perm(uid, "revoke"):
+        if isinstance(event, types.CallbackQuery):
+            return await event.answer("❌ Ruxsat yo'q", show_alert=True)
         return
     try:
         db = get_db()
         try:
             with db.cursor() as c:
-                c.execute(
-                    "SELECT user_id, username, access_until FROM users WHERE access_until > %s ORDER BY access_until DESC",
-                    (datetime.now(),)
-                )
+                c.execute("SELECT user_id, username, access_until FROM users WHERE access_until > %s ORDER BY access_until DESC", (datetime.now(),))
                 rows = c.fetchall()
         finally:
             db.close()
     except Exception as e:
-        print(f"[REVOKE CMD ERROR] {e}")
         rows = []
     if not rows:
         text = "❌ Hozirda premium foydalanuvchilar yo'q."
@@ -1298,7 +1633,7 @@ async def revoke_cmd(event: types.Message | types.CallbackQuery, state: FSMConte
         buttons.append([InlineKeyboardButton(text=f"🚫 @{uname} | {access_until}", callback_data=f"revokeUser:{r['user_id']}")])
     buttons.append([InlineKeyboardButton(text="❌ Yopish", callback_data="revokeClose")])
     kb   = InlineKeyboardMarkup(inline_keyboard=buttons)
-    text = f"🚫 <b>PREMIUM BEKOR QILISH</b>\n\nPremiumini bekor qilmoqchi bo'lgan userni tanlang:\n(Jami: {len(rows)} ta premium user)"
+    text = f"🚫 <b>PREMIUM BEKOR QILISH</b>\n\nUserni tanlang:\n(Jami: {len(rows)} ta premium user)"
     if isinstance(event, types.CallbackQuery):
         await event.answer()
         await event.message.answer(text, reply_markup=kb, parse_mode="HTML")
@@ -1307,7 +1642,7 @@ async def revoke_cmd(event: types.Message | types.CallbackQuery, state: FSMConte
 
 @dp.callback_query(F.data.startswith("revokeUser:"))
 async def revoke_user(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMIN_IDS:
+    if not has_perm(callback.from_user.id, "revoke"):
         return await callback.answer("❌ Ruxsat yo'q", show_alert=True)
     try:
         uid = int(callback.data.split(":")[1])
@@ -1326,12 +1661,11 @@ async def revoke_user(callback: types.CallbackQuery):
         finally:
             db.close()
     except Exception as e:
-        print(f"[REVOKE USER ERROR] {e}")
         return await callback.answer("❌ DB xato", show_alert=True)
     try:
-        await bot.send_message(uid, "⚠️ Sizning premium obunangiz admin tomonidan bekor qilindi.\nBatafsil ma'lumot uchun admin bilan bog'laning.", reply_markup=menu_basic)
-    except Exception as e:
-        print(f"[REVOKE NOTIFY ERROR uid={uid}] {e}")
+        await bot.send_message(uid, "⚠️ Sizning premium obunangiz bekor qilindi.", reply_markup=menu_basic)
+    except Exception:
+        pass
     uname = user["username"] or "—"
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
@@ -1345,28 +1679,31 @@ async def revoke_close(callback: types.CallbackQuery):
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.answer("✅ Yopildi")
 
+
 # ================= ADMIN PANEL =================
 @dp.message(Command("admin"))
 async def admin_panel(message: types.Message):
-    if message.from_user.id not in ADMIN_IDS:
+    uid = message.from_user.id
+    if not is_any_admin(uid):
         return
     stats = get_admin_stats()
-    await message.answer(build_admin_text(stats), reply_markup=admin_panel_kb(), parse_mode="HTML")
+    await message.answer(build_admin_text(stats, uid), reply_markup=admin_panel_kb(uid), parse_mode="HTML")
 
 @dp.callback_query(F.data == "adm:refresh")
 async def adm_refresh(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMIN_IDS:
+    uid = callback.from_user.id
+    if not is_any_admin(uid):
         return await callback.answer("❌ Ruxsat yo'q", show_alert=True)
     stats = get_admin_stats()
     try:
-        await callback.message.edit_text(build_admin_text(stats), reply_markup=admin_panel_kb(), parse_mode="HTML")
+        await callback.message.edit_text(build_admin_text(stats, uid), reply_markup=admin_panel_kb(uid), parse_mode="HTML")
     except Exception:
         pass
     await callback.answer("🔄 Yangilandi")
 
 @dp.callback_query(F.data == "adm:users")
 async def adm_users(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMIN_IDS:
+    if not has_perm(callback.from_user.id, "users"):
         return await callback.answer("❌ Ruxsat yo'q", show_alert=True)
     try:
         db = get_db()
@@ -1377,7 +1714,6 @@ async def adm_users(callback: types.CallbackQuery):
         finally:
             db.close()
     except Exception as e:
-        print(f"[ADM USERS ERROR] {e}")
         rows = []
     await callback.answer()
     if not rows:
@@ -1393,7 +1729,7 @@ async def adm_users(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data == "adm:payments")
 async def adm_payments(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMIN_IDS:
+    if not has_perm(callback.from_user.id, "payments"):
         return await callback.answer("❌ Ruxsat yo'q", show_alert=True)
     try:
         db = get_db()
@@ -1404,7 +1740,6 @@ async def adm_payments(callback: types.CallbackQuery):
         finally:
             db.close()
     except Exception as e:
-        print(f"[ADM PAYMENTS ERROR] {e}")
         rows = []
     await callback.answer()
     if not rows:
@@ -1418,7 +1753,7 @@ async def adm_payments(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data == "adm:expiring")
 async def adm_expiring(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMIN_IDS:
+    if not has_perm(callback.from_user.id, "orders"):
         return await callback.answer("❌ Ruxsat yo'q", show_alert=True)
     now  = datetime.now()
     soon = now + timedelta(days=3)
@@ -1431,7 +1766,6 @@ async def adm_expiring(callback: types.CallbackQuery):
         finally:
             db.close()
     except Exception as e:
-        print(f"[ADM EXPIRING ERROR] {e}")
         rows = []
     await callback.answer()
     if not rows:
@@ -1445,29 +1779,27 @@ async def adm_expiring(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data == "adm:orders")
 async def adm_orders(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMIN_IDS:
+    if not has_perm(callback.from_user.id, "orders"):
         return await callback.answer("❌ Ruxsat yo'q", show_alert=True)
     try:
         db = get_db()
         try:
             with db.cursor() as c:
                 c.execute(
-                    """SELECT o.id, o.user_id, u.username, o.type, o.subject, o.topic,
-                              o.pages, o.deadline, o.status, o.created_at
-                       FROM orders o LEFT JOIN users u ON o.user_id = u.user_id
-                       WHERE o.status IN ('pending','in_progress') ORDER BY o.id DESC"""
+                    "SELECT o.id, o.user_id, u.username, o.type, o.subject, o.topic, o.pages, o.deadline, o.status, o.created_at "
+                    "FROM orders o LEFT JOIN users u ON o.user_id = u.user_id "
+                    "WHERE o.status IN ('pending','in_progress') ORDER BY o.id DESC"
                 )
                 rows = c.fetchall()
         finally:
             db.close()
     except Exception as e:
-        print(f"[ADM ORDERS ERROR] {e}")
         rows = []
     await callback.answer()
     if not rows:
         return await callback.message.answer("✅ Aktiv buyurtmalar yo'q.")
     status_icons = {"pending": "⏳", "in_progress": "🔄"}
-    txt = f"📋 <b>AKTIV BUYURTMALAR ({len(rows)} ta)</b>\n{'─' * 25}\n\n"
+    txt = f"📋 <b>AKTIV BUYURTMALAR ({len(rows)} ta)</b>\n{'─'*25}\n\n"
     for r in rows:
         username     = r["username"] or "—"
         type_name    = ORDER_TYPES.get(r["type"], r["type"])
@@ -1475,20 +1807,19 @@ async def adm_orders(callback: types.CallbackQuery):
         date_str     = r["created_at"].strftime('%d.%m.%Y') if r["created_at"] else "—"
         deadline_txt = format_deadline(r["deadline"])
         txt += (
-            f"{icon} #{r['id']} | {type_name}\n"
-            f"👤 @{username} (<code>{r['user_id']}</code>)\n"
-            f"📚 {r['subject']} — {r['topic']}\n"
-            f"📄 {r['pages']} s. | ⏰ {deadline_txt} | 📅 {date_str}\n"
-            f"/deliver {r['id']} | /delivertext {r['id']}\n{'─' * 25}\n"
+            f"{icon} #{r['id']} | {type_name}\n👤 @{username} (<code>{r['user_id']}</code>)\n"
+            f"📚 {r['subject']} — {r['topic']}\n📄 {r['pages']} s. | ⏰ {deadline_txt} | 📅 {date_str}\n"
+            f"/deliver {r['id']} | /delivertext {r['id']}\n{'─'*25}\n"
         )
     if len(txt) > 4000:
         txt = txt[:4000] + "\n..."
     await callback.message.answer(txt, parse_mode="HTML")
 
-# ================= SLASH COMMANDS =================
+
+# ================= SLASH COMMANDS (owner only) =================
 @dp.message(Command("users"))
 async def users_cmd(message: types.Message):
-    if message.from_user.id not in ADMIN_IDS:
+    if not has_perm(message.from_user.id, "users"):
         return
     try:
         db = get_db()
@@ -1499,7 +1830,6 @@ async def users_cmd(message: types.Message):
         finally:
             db.close()
     except Exception as e:
-        print(f"[USERS CMD ERROR] {e}")
         return await message.answer("❌ DB xato")
     if not rows:
         return await message.answer("❌ Premium userlar yo'q")
@@ -1514,7 +1844,7 @@ async def users_cmd(message: types.Message):
 
 @dp.message(Command("payments"))
 async def payments_cmd(message: types.Message):
-    if message.from_user.id not in ADMIN_IDS:
+    if not has_perm(message.from_user.id, "payments"):
         return
     try:
         db = get_db()
@@ -1525,7 +1855,6 @@ async def payments_cmd(message: types.Message):
         finally:
             db.close()
     except Exception as e:
-        print(f"[PAYMENTS CMD ERROR] {e}")
         return await message.answer("❌ DB xato")
     if not rows:
         return await message.answer("❌ To'lovlar yo'q")
@@ -1538,7 +1867,7 @@ async def payments_cmd(message: types.Message):
 
 @dp.message(Command("expiring"))
 async def expiring_cmd(message: types.Message):
-    if message.from_user.id not in ADMIN_IDS:
+    if not has_perm(message.from_user.id, "orders"):
         return
     now  = datetime.now()
     soon = now + timedelta(days=3)
@@ -1551,7 +1880,6 @@ async def expiring_cmd(message: types.Message):
         finally:
             db.close()
     except Exception as e:
-        print(f"[EXPIRING CMD ERROR] {e}")
         return await message.answer("❌ DB xato")
     if not rows:
         return await message.answer("✅ Tugayotgan obunalar yo'q")
@@ -1564,23 +1892,21 @@ async def expiring_cmd(message: types.Message):
 
 @dp.message(Command("orders"))
 async def orders_cmd(message: types.Message):
-    if message.from_user.id not in ADMIN_IDS:
+    if not has_perm(message.from_user.id, "orders"):
         return
     try:
         db = get_db()
         try:
             with db.cursor() as c:
                 c.execute(
-                    """SELECT o.id, o.user_id, u.username, o.type, o.subject, o.topic,
-                              o.pages, o.deadline, o.status, o.created_at
-                       FROM orders o LEFT JOIN users u ON o.user_id = u.user_id
-                       WHERE o.status IN ('pending','in_progress') ORDER BY o.id DESC"""
+                    "SELECT o.id, o.user_id, u.username, o.type, o.subject, o.topic, o.pages, o.deadline, o.status, o.created_at "
+                    "FROM orders o LEFT JOIN users u ON o.user_id = u.user_id "
+                    "WHERE o.status IN ('pending','in_progress') ORDER BY o.id DESC"
                 )
                 rows = c.fetchall()
         finally:
             db.close()
     except Exception as e:
-        print(f"[ORDERS CMD ERROR] {e}")
         return await message.answer("❌ DB xato")
     if not rows:
         return await message.answer("✅ Aktiv buyurtmalar yo'q.")
@@ -1592,13 +1918,13 @@ async def orders_cmd(message: types.Message):
         deadline_txt = format_deadline(r["deadline"])
         txt += (
             f"🆔 #{r['id']} | {type_name}\n👤 @{username} (<code>{r['user_id']}</code>)\n"
-            f"📚 {r['subject']} — {r['topic']}\n"
-            f"📄 {r['pages']} s. | ⏰ {deadline_txt} | 📅 {date_str}\n"
+            f"📚 {r['subject']} — {r['topic']}\n📄 {r['pages']} s. | ⏰ {deadline_txt} | 📅 {date_str}\n"
             f"/deliver {r['id']} | /delivertext {r['id']}\n{'─'*25}\n"
         )
     if len(txt) > 4000:
         txt = txt[:4000] + "\n..."
     await message.answer(txt, parse_mode="HTML")
+
 
 # ================= WATCHER =================
 async def access_watcher():
@@ -1628,10 +1954,13 @@ async def access_watcher():
             print(f"[Watcher ERROR] {e}")
         await asyncio.sleep(3600)
 
+
 # ================= STARTUP =================
 async def on_startup():
+    ensure_admins_table()
     asyncio.create_task(access_watcher())
     print("✅ Bot ishga tushdi")
+
 
 # ================= RUN =================
 async def main():
