@@ -26,6 +26,20 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas as rl_canvas
 from reportlab.lib.utils import ImageReader
 
+# OpenCV for document edge detection
+try:
+    import cv2
+    HAS_CV2 = True
+except ImportError:
+    HAS_CV2 = False
+
+# scipy for morphological ops (optional boost)
+try:
+    from scipy import ndimage as ndi
+    HAS_SCIPY = True
+except ImportError:
+    HAS_SCIPY = False
+
 # ================= CONFIG =================
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -137,11 +151,9 @@ class SubAdminStates(StatesGroup):
     waiting_user_id = State()
     choosing_perms  = State()
 
-# NEW: Support FSM
 class SupportStates(StatesGroup):
     waiting_message = State()
 
-# NEW: Admin reply-to-support FSM
 class SupportReplyStates(StatesGroup):
     waiting_reply = State()
 
@@ -291,7 +303,6 @@ def admin_panel_kb(uid: int) -> InlineKeyboardMarkup:
     if row3:
         rows.append(row3)
 
-    # NEW: Pending payments list button
     if has_perm(uid, "payments"):
         rows.append([InlineKeyboardButton(text="⏳ Kutilayotgan to'lovlar", callback_data="adm:pending_payments")])
 
@@ -520,9 +531,7 @@ def build_admin_text(stats: dict, uid: int) -> str:
     base += f"\n📅 {datetime.now().strftime('%d.%m.%Y %H:%M')}"
     return base
 
-# ─── NEW: 24-hour payment check limit ───────────────────────────
 def user_submitted_check_today(uid: int) -> bool:
-    """Returns True if user already submitted a payment check in the last 24 hours."""
     try:
         db = get_db()
         try:
@@ -539,51 +548,234 @@ def user_submitted_check_today(uid: int) -> bool:
         print(f"[user_submitted_check_today ERROR] {e}")
         return False
 
+
 # ================================================================
-# ═════════  SCAN PROCESSING — Adaptive (CamScanner style)  ══════
+# ══════════  AUTO-CROP DOCUMENT EDGES (CamScanner style)  ═══════
 # ================================================================
+
+def order_points(pts: np.ndarray) -> np.ndarray:
+    """Order 4 corner points: top-left, top-right, bottom-right, bottom-left."""
+    rect = np.zeros((4, 2), dtype=np.float32)
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]   # top-left
+    rect[2] = pts[np.argmax(s)]   # bottom-right
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)]  # top-right
+    rect[3] = pts[np.argmax(diff)]  # bottom-left
+    return rect
+
+
+def four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
+    """Perspective-correct warp to a top-down rectangle."""
+    rect = order_points(pts)
+    (tl, tr, br, bl) = rect
+
+    widthA  = np.linalg.norm(br - bl)
+    widthB  = np.linalg.norm(tr - tl)
+    maxW    = max(int(widthA), int(widthB))
+
+    heightA = np.linalg.norm(tr - br)
+    heightB = np.linalg.norm(tl - bl)
+    maxH    = max(int(heightA), int(heightB))
+
+    dst = np.array([
+        [0, 0],
+        [maxW - 1, 0],
+        [maxW - 1, maxH - 1],
+        [0, maxH - 1]
+    ], dtype=np.float32)
+
+    M       = cv2.getPerspectiveTransform(rect, dst)
+    warped  = cv2.warpPerspective(image, M, (maxW, maxH))
+    return warped
+
+
+def auto_crop_document(pil_img: Image.Image) -> Image.Image:
+    """
+    Detect the document boundary and perspective-correct warp it.
+    Falls back to the original image if no clear quadrilateral is found.
+    Requires OpenCV.
+    """
+    if not HAS_CV2:
+        return pil_img
+
+    orig = np.array(pil_img.convert("RGB"))
+    h, w = orig.shape[:2]
+
+    # ── Downscale for fast contour detection ──────────────────────
+    scale     = 800 / max(h, w)
+    small     = cv2.resize(orig, (int(w * scale), int(h * scale)))
+    gray      = cv2.cvtColor(small, cv2.COLOR_RGB2GRAY)
+
+    # ── Bilateral filter keeps edges sharp while smoothing texture ─
+    blurred   = cv2.bilateralFilter(gray, 9, 75, 75)
+
+    # ── Canny edge detection with auto thresholds ─────────────────
+    med       = float(np.median(blurred))
+    lo, hi    = int(max(0, 0.66 * med)), int(min(255, 1.33 * med))
+    edges     = cv2.Canny(blurred, lo, hi)
+    edges     = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
+
+    # ── Find the largest 4-point contour ─────────────────────────
+    cnts, _   = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    cnts      = sorted(cnts, key=cv2.contourArea, reverse=True)[:10]
+
+    screen_cnt = None
+    for c in cnts:
+        peri   = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+        if len(approx) == 4:
+            area = cv2.contourArea(approx)
+            # Must cover at least 15% of the small image
+            if area > 0.15 * small.shape[0] * small.shape[1]:
+                screen_cnt = approx
+                break
+
+    if screen_cnt is None:
+        return pil_img  # No document found – return as-is
+
+    # ── Scale corners back to original resolution ─────────────────
+    pts      = screen_cnt.reshape(4, 2).astype(np.float32)
+    pts     /= scale
+
+    warped   = four_point_transform(orig, pts)
+    return Image.fromarray(warped)
+
+
+# ================================================================
+# ══════════  PROFESSIONAL SCAN PROCESSING PIPELINE  ═════════════
+# ================================================================
+
 def process_scan_image(img: Image.Image) -> Image.Image:
+    """
+    Full CamScanner-quality pipeline:
+      1. Auto-crop / perspective-correct
+      2. Upscale for processing quality
+      3. Denoise
+      4. Adaptive threshold (eliminates ALL shadows)
+      5. Morphological cleanup
+      6. Sharpen text edges
+      7. Final white-paper / black-ink binarization
+    """
+    # ── Step 1: Auto-crop document edges ──────────────────────────
+    img = auto_crop_document(img)
+
+    # ── Step 2: Convert to grayscale & upscale for quality ─────────
     img = img.convert("L")
-    img = ImageEnhance.Sharpness(img).enhance(3.0)
-    h, w = img.size[1], img.size[0]
-    blur_radius = max(30, min(h, w) // 15)
-    bg_img = img.filter(ImageFilter.GaussianBlur(radius=blur_radius))
-    arr = np.array(img, dtype=np.float32)
-    bg  = np.array(bg_img, dtype=np.float32)
-    offset = 15
-    binary = np.where(arr < (bg - offset), 0, 255).astype(np.uint8)
-    result_img = Image.fromarray(binary, mode="L")
-    result_img = result_img.point(lambda x: 0 if x < 128 else 255)
-    result_img = result_img.filter(
-        ImageFilter.UnsharpMask(radius=1, percent=150, threshold=3)
-    )
-    result_img = result_img.point(lambda x: 0 if x < 180 else 255)
+    orig_w, orig_h = img.size
+
+    # Upscale to at least 2400px on the long side for crisp output
+    long_side = max(orig_w, orig_h)
+    if long_side < 2400:
+        factor = 2400 / long_side
+        img = img.resize(
+            (int(orig_w * factor), int(orig_h * factor)),
+            Image.LANCZOS
+        )
+
+    arr = np.array(img, dtype=np.uint8)
+
+    if HAS_CV2:
+        # ── Step 3a: Denoise with OpenCV fastNlMeans ─────────────
+        arr = cv2.fastNlMeansDenoising(arr, h=10, templateWindowSize=7, searchWindowSize=21)
+
+        # ── Step 4a: CLAHE contrast enhancement ───────────────────
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        arr   = clahe.apply(arr)
+
+        # ── Step 5a: Adaptive threshold — the key shadow killer ───
+        # Uses a large block size so illumination gradients are fully compensated
+        binary = cv2.adaptiveThreshold(
+            arr,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            blockSize=51,   # large block catches wide shadow gradients
+            C=18            # aggressive offset for crisp black ink
+        )
+
+        # ── Step 6a: Morphological cleanup (remove noise dots) ────
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN,  kernel)
+
+        # ── Step 7a: Unsharp mask for crisp text edges ────────────
+        blurred_sharp = cv2.GaussianBlur(binary, (0, 0), 1.2)
+        binary        = cv2.addWeighted(binary, 1.8, blurred_sharp, -0.8, 0)
+        _, binary     = cv2.threshold(binary, 127, 255, cv2.THRESH_BINARY)
+
+        result_arr = binary
+
+    else:
+        # ── Fallback (no OpenCV): pure NumPy/PIL pipeline ─────────
+
+        # Step 3b: Gaussian blur for noise reduction
+        blurred = Image.fromarray(arr).filter(ImageFilter.GaussianBlur(radius=1))
+        arr     = np.array(blurred, dtype=np.float32)
+
+        # Step 4b: Enhance contrast
+        p2, p98 = np.percentile(arr, 2), np.percentile(arr, 98)
+        if p98 > p2:
+            arr = np.clip((arr - p2) / (p98 - p2) * 255, 0, 255)
+
+        # Step 5b: Local adaptive threshold via large-window background estimate
+        arr_u8  = arr.astype(np.uint8)
+        bg_img  = Image.fromarray(arr_u8).filter(ImageFilter.GaussianBlur(radius=40))
+        bg      = np.array(bg_img, dtype=np.float32)
+        # Subtract illumination — any pixel darker than background by threshold → ink
+        diff    = bg.astype(np.float32) - arr.astype(np.float32)
+        binary  = np.where(diff > 20, 0, 255).astype(np.uint8)
+
+        # Step 6b: Cleanup with a second threshold pass
+        binary  = np.where(binary < 128, 0, 255).astype(np.uint8)
+
+        # Step 7b: Sharpening via PIL
+        sharp_img = Image.fromarray(binary)
+        sharp_img = sharp_img.filter(
+            ImageFilter.UnsharpMask(radius=1, percent=200, threshold=2)
+        )
+        binary    = np.where(np.array(sharp_img) < 128, 0, 255).astype(np.uint8)
+
+        result_arr = binary
+
+    # ── Final: pure B&W — make whites brilliant ────────────────────
+    # Any gray residue ≥ 220 → pure white; ≤ 80 → pure black
+    result_arr = np.where(result_arr >= 220, 255,
+                 np.where(result_arr <= 80,    0, result_arr)).astype(np.uint8)
+
+    result_img = Image.fromarray(result_arr, mode="L")
+
+    # ── Compose on RGB white canvas ────────────────────────────────
     out = Image.new("RGB", result_img.size, (255, 255, 255))
     out.paste(result_img)
     return out
 
+
 # ================================================================
-# ═════════  PDF BUILDER — Uniform A4 pages via ReportLab  ═══════
+# ═════════════  PDF BUILDER — Uniform A4 pages  ═════════════════
 # ================================================================
+
 def build_pdf_with_reportlab(pil_images: list, pdf_path: str):
     PAGE_W, PAGE_H = A4
-    MARGIN = 28
+    MARGIN   = 20          # tighter margin for scan PDFs — more paper coverage
     usable_w = PAGE_W - 2 * MARGIN
     usable_h = PAGE_H - 2 * MARGIN
     c = rl_canvas.Canvas(pdf_path, pagesize=A4)
     for pil_img in pil_images:
         img_w, img_h = pil_img.size
-        scale  = min(usable_w / img_w, usable_h / img_h)
-        draw_w = img_w * scale
-        draw_h = img_h * scale
+        scale        = min(usable_w / img_w, usable_h / img_h)
+        draw_w       = img_w * scale
+        draw_h       = img_h * scale
         x = MARGIN + (usable_w - draw_w) / 2
         y = MARGIN + (usable_h - draw_h) / 2
         buf = io.BytesIO()
-        pil_img.save(buf, format="JPEG", quality=92, optimize=True)
+        # Use high-quality compression for scan images
+        pil_img.save(buf, format="JPEG", quality=95, optimize=True, subsampling=0)
         buf.seek(0)
         c.drawImage(ImageReader(buf), x, y, width=draw_w, height=draw_h)
         c.showPage()
     c.save()
+
 
 # ================= EXCEL BUILDER =================
 def build_users_excel(rows: list) -> bytes:
@@ -646,12 +838,11 @@ async def info_handler(message: types.Message):
     await message.answer(BOT_INFO_TEXT, parse_mode="HTML")
 
 # ================================================================
-# ══════════════  SUPPORT / YORDAM  (NEW)  ═══════════════════════
+# ══════════════  SUPPORT / YORDAM  ══════════════════════════════
 # ================================================================
 
 @dp.message(F.text == "🆘 Yordam")
 async def support_start(message: types.Message, state: FSMContext):
-    """User presses Support — ask them to write their message."""
     await state.set_state(SupportStates.waiting_message)
     await message.answer(
         "✍️ Xabaringizni yozing:",
@@ -660,13 +851,11 @@ async def support_start(message: types.Message, state: FSMContext):
 
 @dp.message(SupportStates.waiting_message, F.text)
 async def support_receive(message: types.Message, state: FSMContext):
-    """Forward user message to admin and confirm to user."""
     uid      = message.from_user.id
     username = message.from_user.username or "—"
     text     = message.text.strip()
     await state.clear()
 
-    # Build caption for admin
     admin_txt = (
         f"💬 <b>YORDAM SO'ROVI</b>\n"
         f"👤 @{username} (ID: <code>{uid}</code>)\n"
@@ -674,7 +863,6 @@ async def support_receive(message: types.Message, state: FSMContext):
         f"{'─'*25}\n\n"
         f"{text}"
     )
-    # Inline button so admin can tap to reply
     reply_kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="↩️ Javob berish", callback_data=f"supReply:{uid}")
     ]])
@@ -688,7 +876,6 @@ async def support_receive(message: types.Message, state: FSMContext):
         reply_markup=get_menu(uid)
     )
 
-# Admin clicks "↩️ Javob berish" inline button
 @dp.callback_query(F.data.startswith("supReply:"))
 async def support_reply_start(callback: types.CallbackQuery, state: FSMContext):
     if callback.from_user.id != OWNER_ID:
@@ -1105,7 +1292,7 @@ async def pdf_start(message: types.Message, state: FSMContext):
             )
     await message.answer(
         "📄 <b>PDF YARATISH</b>\n\nQaysi turdagi PDF kerak?\n\n"
-        "🔬 <b>Skan PDF</b> — CamScanner uslubida: oq fon, qora matn, professional ko'rinish\n"
+        "🔬 <b>Skan PDF</b> — CamScanner uslubida: oq fon, qora matn, barcha soya va dog'lar yo'q\n"
         "📄 <b>Oddiy PDF</b> — Rasmlar o'zgarishsiz PDF ga birlashtiriladi",
         reply_markup=kb_pdf_type(), parse_mode="HTML"
     )
@@ -1223,12 +1410,10 @@ async def payment_info(message: types.Message):
 @dp.message(F.text == "✅ To'lov qildim")
 async def wait_for_check(message: types.Message, state: FSMContext):
     uid = message.from_user.id
-    # ─── NEW: 24-hour limit ──────────────────────────────────────
     if user_submitted_check_today(uid) and uid != OWNER_ID:
         return await message.answer(
             "⚠️ Siz bugungi limitdan foydalandingiz, ertaga qayta bosing."
         )
-    # ────────────────────────────────────────────────────────────
     await state.set_state(PaymentStates.waiting_check)
     await message.answer("🧾 Chekni yuboring (rasm yoki PDF)")
 
@@ -1389,7 +1574,7 @@ async def reject_payment(callback: types.CallbackQuery):
     await callback.answer("❌ Rad etildi")
 
 # ================================================================
-# ════════  PENDING PAYMENTS LIST  (NEW)  ════════════════════════
+# ════════  PENDING PAYMENTS LIST  ═══════════════════════════════
 # ================================================================
 
 @dp.message(Command("pendingpay"))
@@ -1909,7 +2094,6 @@ async def broadcast_send(callback: types.CallbackQuery, state: FSMContext):
     success = failed = 0
     for i, uid in enumerate(user_ids, 1):
         try:
-            # ─── NEW: Prepend bold "Admin:" label to text broadcasts ──
             if msg_type == "text" and original_txt:
                 await bot.send_message(
                     chat_id=uid,
@@ -2332,6 +2516,10 @@ async def on_startup():
     ensure_admins_table()
     asyncio.create_task(access_watcher())
     print("✅ Bot ishga tushdi")
+    if HAS_CV2:
+        print("✅ OpenCV mavjud — auto-crop va professional skan yoqildi")
+    else:
+        print("⚠️  OpenCV yo'q — fallback skan rejimi ishlatiladi (pip install opencv-python-headless)")
 
 
 async def main():
