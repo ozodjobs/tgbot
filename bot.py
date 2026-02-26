@@ -22,7 +22,7 @@ from PIL import Image
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-ADMIN_IDS = {6875167708,6645021338}
+ADMIN_IDS = {6645021338,6875167708}
 
 PAYNET_LINK = "https://app.paynet.uz/?m=49156&i=1abfad1a-2da7-4d8d-8509-39f59b32d538"
 
