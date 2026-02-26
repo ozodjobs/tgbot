@@ -43,6 +43,7 @@ except ImportError:
 # ================= CONFIG =================
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_USERNAME = os.getenv("BOT_USERNAME", "YourBotUsername")  # Set this in .env!
 
 OWNER_ID = 6875167708
 ADMIN_IDS = {OWNER_ID}
@@ -79,6 +80,10 @@ PERM_LABELS = {
     "listusers": "📊 Excel ro'yxat",
 }
 
+# ── Referral config ──────────────────────────────────────────────
+REFERRAL_REQUIRED   = 10   # Number of referrals needed for free premium
+REFERRAL_REWARD_DAYS = 30  # Days of premium awarded on reaching the goal
+
 BOT_INFO_TEXT = """ℹ️ <b>BOT HAQIDA MA'LUMOT</b>
 
 Ushbu bot quyidagi imkoniyatlarni taqdim etadi:
@@ -111,13 +116,19 @@ Ushbu bot quyidagi imkoniyatlarni taqdim etadi:
 
 ━━━━━━━━━━━━━━━━━━━━━
 
+👥 <b>DO'ST TAKLIF QILISH</b>
+  {req} ta do'stingizni taklif qiling va <b>{days} kunlik premium</b> yutib oling!
+  Har bir yangi foydalanuvchi hisobga olinadi.
+
+━━━━━━━━━━━━━━━━━━━━━
+
 ⏰ Buyurtma muddati: 1–10 kun
 📁 Fayl formatlari: PDF, Word, Excel, PowerPoint
 📊 Oylik limit: 10 ta buyurtma
 
 ━━━━━━━━━━━━━━━━━━━━━
 
-Savollar uchun admin bilan bog'laning."""
+Savollar uchun admin bilan bog'laning.""".format(req=REFERRAL_REQUIRED, days=REFERRAL_REWARD_DAYS)
 
 # ================= FSM STATES =================
 class PDFStates(StatesGroup):
@@ -170,11 +181,12 @@ def get_db():
         connect_timeout=10
     )
 
-def ensure_admins_table():
+def ensure_tables():
     try:
         db = get_db()
         try:
             with db.cursor() as c:
+                # Admins table
                 c.execute("""
                     CREATE TABLE IF NOT EXISTS admins (
                         user_id    BIGINT PRIMARY KEY,
@@ -183,10 +195,187 @@ def ensure_admins_table():
                         added_at   DATETIME DEFAULT CURRENT_TIMESTAMP
                     )
                 """)
+                # Referrals table
+                # referred_by = user_id of the person who shared the link
+                c.execute("""
+                    CREATE TABLE IF NOT EXISTS referrals (
+                        id           BIGINT AUTO_INCREMENT PRIMARY KEY,
+                        referrer_id  BIGINT NOT NULL,
+                        referee_id   BIGINT NOT NULL UNIQUE,
+                        rewarded     TINYINT(1) DEFAULT 0,
+                        created_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        INDEX idx_referrer (referrer_id)
+                    )
+                """)
+                # Make sure users table has a ref_code column
+                try:
+                    c.execute("ALTER TABLE users ADD COLUMN ref_code VARCHAR(16) UNIQUE DEFAULT NULL")
+                except Exception:
+                    pass  # Column already exists
         finally:
             db.close()
     except Exception as e:
-        print(f"[ensure_admins_table ERROR] {e}")
+        print(f"[ensure_tables ERROR] {e}")
+
+# ── Backward-compat alias ────────────────────────────────────────
+def ensure_admins_table():
+    ensure_tables()
+
+# ================= REFERRAL HELPERS =================
+
+def get_or_create_ref_code(uid: int) -> str:
+    """Return existing ref_code for uid, or generate and save a new one."""
+    try:
+        db = get_db()
+        try:
+            with db.cursor() as c:
+                c.execute("SELECT ref_code FROM users WHERE user_id=%s", (uid,))
+                row = c.fetchone()
+                if row and row.get("ref_code"):
+                    return row["ref_code"]
+                # Generate a short unique code
+                code = uuid.uuid4().hex[:8].upper()
+                c.execute("UPDATE users SET ref_code=%s WHERE user_id=%s", (code, uid))
+                return code
+        finally:
+            db.close()
+    except Exception as e:
+        print(f"[get_or_create_ref_code ERROR] {e}")
+        return uuid.uuid4().hex[:8].upper()
+
+
+def get_referral_count(uid: int) -> int:
+    """How many people uid has successfully referred."""
+    try:
+        db = get_db()
+        try:
+            with db.cursor() as c:
+                c.execute("SELECT COUNT(*) AS c FROM referrals WHERE referrer_id=%s", (uid,))
+                return c.fetchone()["c"]
+        finally:
+            db.close()
+    except Exception as e:
+        print(f"[get_referral_count ERROR] {e}")
+        return 0
+
+
+def get_rewarded_referral_count(uid: int) -> int:
+    """How many reward milestones have already been granted to uid."""
+    try:
+        db = get_db()
+        try:
+            with db.cursor() as c:
+                c.execute("SELECT COUNT(*) AS c FROM referrals WHERE referrer_id=%s AND rewarded=1", (uid,))
+                return c.fetchone()["c"]
+        finally:
+            db.close()
+    except Exception as e:
+        print(f"[get_rewarded_referral_count ERROR] {e}")
+        return 0
+
+
+def get_uid_by_ref_code(code: str):
+    """Return user_id whose ref_code matches, or None."""
+    try:
+        db = get_db()
+        try:
+            with db.cursor() as c:
+                c.execute("SELECT user_id FROM users WHERE ref_code=%s", (code,))
+                row = c.fetchone()
+                return row["user_id"] if row else None
+        finally:
+            db.close()
+    except Exception as e:
+        print(f"[get_uid_by_ref_code ERROR] {e}")
+        return None
+
+
+def record_referral(referrer_id: int, referee_id: int) -> bool:
+    """
+    Save the referral link.
+    Returns True if this is a NEW referral (not already recorded).
+    """
+    try:
+        db = get_db()
+        try:
+            with db.cursor() as c:
+                # Make sure referrer and referee are different people
+                if referrer_id == referee_id:
+                    return False
+                # Check if referee already has a referral recorded
+                c.execute("SELECT id FROM referrals WHERE referee_id=%s", (referee_id,))
+                if c.fetchone():
+                    return False
+                c.execute(
+                    "INSERT INTO referrals (referrer_id, referee_id) VALUES (%s, %s)",
+                    (referrer_id, referee_id)
+                )
+                return True
+        finally:
+            db.close()
+    except Exception as e:
+        print(f"[record_referral ERROR] {e}")
+        return False
+
+
+async def check_and_reward_referrer(referrer_id: int):
+    """
+    Check if referrer has hit a new REFERRAL_REQUIRED milestone and hasn't
+    been rewarded for it yet.  Award REFERRAL_REWARD_DAYS of premium if so.
+    """
+    try:
+        total    = get_referral_count(referrer_id)
+        rewarded = get_rewarded_referral_count(referrer_id)
+
+        # How many complete milestones earned vs already rewarded
+        milestones_earned  = total    // REFERRAL_REQUIRED
+        milestones_rewarded = rewarded // REFERRAL_REQUIRED
+
+        if milestones_earned <= milestones_rewarded:
+            return  # No new milestone yet
+
+        # Grant premium for each unrewarded milestone
+        new_milestones = milestones_earned - milestones_rewarded
+        days_to_add    = new_milestones * REFERRAL_REWARD_DAYS
+
+        db = get_db()
+        try:
+            with db.cursor() as c:
+                # Extend premium
+                c.execute(
+                    """UPDATE users
+                       SET access_until = GREATEST(COALESCE(access_until, NOW()), NOW()) + INTERVAL %s DAY,
+                           warned = 0
+                       WHERE user_id = %s""",
+                    (days_to_add, referrer_id)
+                )
+                # Mark the referrals up to this milestone as rewarded
+                # Mark exactly REFERRAL_REQUIRED * new_milestones rows as rewarded
+                rows_to_reward = new_milestones * REFERRAL_REQUIRED
+                c.execute(
+                    """UPDATE referrals
+                       SET rewarded = 1
+                       WHERE referrer_id = %s AND rewarded = 0
+                       ORDER BY id ASC
+                       LIMIT %s""",
+                    (referrer_id, rows_to_reward)
+                )
+        finally:
+            db.close()
+
+        msg = (
+            f"🎉 <b>Tabriklaymiz!</b>\n\n"
+            f"Siz <b>{REFERRAL_REQUIRED} ta do'stingizni</b> taklif qildingiz!\n"
+            f"<b>{days_to_add} kunlik premium</b> hisobingizga qo'shildi! ✅"
+        )
+        try:
+            await bot.send_message(referrer_id, msg, parse_mode="HTML", reply_markup=menu_premium)
+        except Exception as e:
+            print(f"[REWARD SEND ERROR uid={referrer_id}] {e}")
+
+    except Exception as e:
+        print(f"[check_and_reward_referrer ERROR] {e}")
+
 
 # ================= PERMISSION HELPERS =================
 def get_sub_admin(uid: int) -> dict | None:
@@ -251,7 +440,8 @@ menu_basic = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📄 PDF yaratish")],
         [KeyboardButton(text="💳 To'lov qilish"), KeyboardButton(text="✅ To'lov qildim")],
-        [KeyboardButton(text="ℹ️ Ma'lumot"),       KeyboardButton(text="🆘 Yordam")]
+        [KeyboardButton(text="ℹ️ Ma'lumot"),       KeyboardButton(text="🆘 Yordam")],
+        [KeyboardButton(text="👥 Do'st taklif qilish")]
     ],
     resize_keyboard=True
 )
@@ -262,7 +452,8 @@ menu_premium = ReplyKeyboardMarkup(
         [KeyboardButton(text="📝 Referat yozdirish")],
         [KeyboardButton(text="📘 Mustaqil ish yozdirish")],
         [KeyboardButton(text="📋 Buyurtmalarim")],
-        [KeyboardButton(text="ℹ️ Ma'lumot"),       KeyboardButton(text="🆘 Yordam")]
+        [KeyboardButton(text="ℹ️ Ma'lumot"),       KeyboardButton(text="🆘 Yordam")],
+        [KeyboardButton(text="👥 Do'st taklif qilish")]
     ],
     resize_keyboard=True
 )
@@ -554,90 +745,64 @@ def user_submitted_check_today(uid: int) -> bool:
 # ================================================================
 
 def order_points(pts: np.ndarray) -> np.ndarray:
-    """Order 4 corner points: top-left, top-right, bottom-right, bottom-left."""
     rect = np.zeros((4, 2), dtype=np.float32)
     s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]   # top-left
-    rect[2] = pts[np.argmax(s)]   # bottom-right
+    rect[0] = pts[np.argmin(s)]
+    rect[2] = pts[np.argmax(s)]
     diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]  # top-right
-    rect[3] = pts[np.argmax(diff)]  # bottom-left
+    rect[1] = pts[np.argmin(diff)]
+    rect[3] = pts[np.argmax(diff)]
     return rect
 
 
 def four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
-    """Perspective-correct warp to a top-down rectangle."""
     rect = order_points(pts)
     (tl, tr, br, bl) = rect
-
     widthA  = np.linalg.norm(br - bl)
     widthB  = np.linalg.norm(tr - tl)
     maxW    = max(int(widthA), int(widthB))
-
     heightA = np.linalg.norm(tr - br)
     heightB = np.linalg.norm(tl - bl)
     maxH    = max(int(heightA), int(heightB))
-
     dst = np.array([
         [0, 0],
         [maxW - 1, 0],
         [maxW - 1, maxH - 1],
         [0, maxH - 1]
     ], dtype=np.float32)
-
     M       = cv2.getPerspectiveTransform(rect, dst)
     warped  = cv2.warpPerspective(image, M, (maxW, maxH))
     return warped
 
 
 def auto_crop_document(pil_img: Image.Image) -> Image.Image:
-    """
-    Detect the document boundary and perspective-correct warp it.
-    Falls back to the original image if no clear quadrilateral is found.
-    Requires OpenCV.
-    """
     if not HAS_CV2:
         return pil_img
-
     orig = np.array(pil_img.convert("RGB"))
     h, w = orig.shape[:2]
-
-    # ── Downscale for fast contour detection ──────────────────────
     scale     = 800 / max(h, w)
     small     = cv2.resize(orig, (int(w * scale), int(h * scale)))
     gray      = cv2.cvtColor(small, cv2.COLOR_RGB2GRAY)
-
-    # ── Bilateral filter keeps edges sharp while smoothing texture ─
     blurred   = cv2.bilateralFilter(gray, 9, 75, 75)
-
-    # ── Canny edge detection with auto thresholds ─────────────────
     med       = float(np.median(blurred))
     lo, hi    = int(max(0, 0.66 * med)), int(min(255, 1.33 * med))
     edges     = cv2.Canny(blurred, lo, hi)
     edges     = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
-
-    # ── Find the largest 4-point contour ─────────────────────────
     cnts, _   = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     cnts      = sorted(cnts, key=cv2.contourArea, reverse=True)[:10]
-
     screen_cnt = None
     for c in cnts:
         peri   = cv2.arcLength(c, True)
         approx = cv2.approxPolyDP(c, 0.02 * peri, True)
         if len(approx) == 4:
             area = cv2.contourArea(approx)
-            # Must cover at least 15% of the small image
             if area > 0.15 * small.shape[0] * small.shape[1]:
                 screen_cnt = approx
                 break
-
     if screen_cnt is None:
-        return pil_img  # No document found – return as-is
-
-    # ── Scale corners back to original resolution ─────────────────
+        return pil_img
     pts      = screen_cnt.reshape(4, 2).astype(np.float32)
     pts     /= scale
-
     warped   = four_point_transform(orig, pts)
     return Image.fromarray(warped)
 
@@ -647,24 +812,9 @@ def auto_crop_document(pil_img: Image.Image) -> Image.Image:
 # ================================================================
 
 def process_scan_image(img: Image.Image) -> Image.Image:
-    """
-    Full CamScanner-quality pipeline:
-      1. Auto-crop / perspective-correct
-      2. Upscale for processing quality
-      3. Denoise
-      4. Adaptive threshold (eliminates ALL shadows)
-      5. Morphological cleanup
-      6. Sharpen text edges
-      7. Final white-paper / black-ink binarization
-    """
-    # ── Step 1: Auto-crop document edges ──────────────────────────
     img = auto_crop_document(img)
-
-    # ── Step 2: Convert to grayscale & upscale for quality ─────────
     img = img.convert("L")
     orig_w, orig_h = img.size
-
-    # Upscale to at least 2400px on the long side for crisp output
     long_side = max(orig_w, orig_h)
     if long_side < 2400:
         factor = 2400 / long_side
@@ -672,92 +822,51 @@ def process_scan_image(img: Image.Image) -> Image.Image:
             (int(orig_w * factor), int(orig_h * factor)),
             Image.LANCZOS
         )
-
     arr = np.array(img, dtype=np.uint8)
-
     if HAS_CV2:
-        # ── Step 3a: Denoise with OpenCV fastNlMeans ─────────────
-        arr = cv2.fastNlMeansDenoising(arr, h=10, templateWindowSize=7, searchWindowSize=21)
-
-        # ── Step 4a: CLAHE contrast enhancement ───────────────────
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        arr   = clahe.apply(arr)
-
-        # ── Step 5a: Adaptive threshold — the key shadow killer ───
-        # Uses a large block size so illumination gradients are fully compensated
-        binary = cv2.adaptiveThreshold(
-            arr,
-            255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY,
-            blockSize=51,   # large block catches wide shadow gradients
-            C=18            # aggressive offset for crisp black ink
-        )
-
-        # ── Step 6a: Morphological cleanup (remove noise dots) ────
+        arr    = cv2.fastNlMeansDenoising(arr, h=10, templateWindowSize=7, searchWindowSize=21)
+        clahe  = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        arr    = clahe.apply(arr)
+        binary = cv2.adaptiveThreshold(arr, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                       cv2.THRESH_BINARY, blockSize=51, C=18)
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
         binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
         binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN,  kernel)
-
-        # ── Step 7a: Unsharp mask for crisp text edges ────────────
         blurred_sharp = cv2.GaussianBlur(binary, (0, 0), 1.2)
         binary        = cv2.addWeighted(binary, 1.8, blurred_sharp, -0.8, 0)
         _, binary     = cv2.threshold(binary, 127, 255, cv2.THRESH_BINARY)
-
         result_arr = binary
-
     else:
-        # ── Fallback (no OpenCV): pure NumPy/PIL pipeline ─────────
-
-        # Step 3b: Gaussian blur for noise reduction
         blurred = Image.fromarray(arr).filter(ImageFilter.GaussianBlur(radius=1))
         arr     = np.array(blurred, dtype=np.float32)
-
-        # Step 4b: Enhance contrast
         p2, p98 = np.percentile(arr, 2), np.percentile(arr, 98)
         if p98 > p2:
             arr = np.clip((arr - p2) / (p98 - p2) * 255, 0, 255)
-
-        # Step 5b: Local adaptive threshold via large-window background estimate
         arr_u8  = arr.astype(np.uint8)
         bg_img  = Image.fromarray(arr_u8).filter(ImageFilter.GaussianBlur(radius=40))
         bg      = np.array(bg_img, dtype=np.float32)
-        # Subtract illumination — any pixel darker than background by threshold → ink
         diff    = bg.astype(np.float32) - arr.astype(np.float32)
         binary  = np.where(diff > 20, 0, 255).astype(np.uint8)
-
-        # Step 6b: Cleanup with a second threshold pass
         binary  = np.where(binary < 128, 0, 255).astype(np.uint8)
-
-        # Step 7b: Sharpening via PIL
         sharp_img = Image.fromarray(binary)
-        sharp_img = sharp_img.filter(
-            ImageFilter.UnsharpMask(radius=1, percent=200, threshold=2)
-        )
+        sharp_img = sharp_img.filter(ImageFilter.UnsharpMask(radius=1, percent=200, threshold=2))
         binary    = np.where(np.array(sharp_img) < 128, 0, 255).astype(np.uint8)
-
         result_arr = binary
-
-    # ── Final: pure B&W — make whites brilliant ────────────────────
-    # Any gray residue ≥ 220 → pure white; ≤ 80 → pure black
     result_arr = np.where(result_arr >= 220, 255,
                  np.where(result_arr <= 80,    0, result_arr)).astype(np.uint8)
-
     result_img = Image.fromarray(result_arr, mode="L")
-
-    # ── Compose on RGB white canvas ────────────────────────────────
     out = Image.new("RGB", result_img.size, (255, 255, 255))
     out.paste(result_img)
     return out
 
 
 # ================================================================
-# ═════════════  PDF BUILDER — Uniform A4 pages  ═════════════════
+# ═════════════  PDF BUILDER  ════════════════════════════════════
 # ================================================================
 
 def build_pdf_with_reportlab(pil_images: list, pdf_path: str):
     PAGE_W, PAGE_H = A4
-    MARGIN   = 20          # tighter margin for scan PDFs — more paper coverage
+    MARGIN   = 20
     usable_w = PAGE_W - 2 * MARGIN
     usable_h = PAGE_H - 2 * MARGIN
     c = rl_canvas.Canvas(pdf_path, pagesize=A4)
@@ -769,7 +878,6 @@ def build_pdf_with_reportlab(pil_images: list, pdf_path: str):
         x = MARGIN + (usable_w - draw_w) / 2
         y = MARGIN + (usable_h - draw_h) / 2
         buf = io.BytesIO()
-        # Use high-quality compression for scan images
         pil_img.save(buf, format="JPEG", quality=95, optimize=True, subsampling=0)
         buf.seek(0)
         c.drawImage(ImageReader(buf), x, y, width=draw_w, height=draw_h)
@@ -786,8 +894,8 @@ def build_users_excel(rows: list) -> bytes:
     header_font  = Font(bold=True, color="FFFFFF", name="Arial", size=11)
     center_align = Alignment(horizontal="center", vertical="center")
     left_align   = Alignment(horizontal="left",   vertical="center")
-    headers    = ["#", "User ID", "Username", "Status", "Obuna tugashi", "Ro'yxatdan o'tgan"]
-    col_widths = [5,   16,        24,          14,       18,              22]
+    headers    = ["#", "User ID", "Username", "Status", "Obuna tugashi", "Ro'yxatdan o'tgan", "Takliflar"]
+    col_widths = [5,   16,        24,          14,       18,              22,                   12]
     for col_idx, (header, width) in enumerate(zip(headers, col_widths), start=1):
         cell = ws.cell(row=1, column=col_idx, value=header)
         cell.font, cell.fill, cell.alignment = header_font, header_fill, center_align
@@ -806,14 +914,15 @@ def build_users_excel(rows: list) -> bytes:
         status     = "✅ Premium" if is_premium else "👤 Oddiy"
         access_str = r["access_until"].strftime("%d.%m.%Y") if r.get("access_until") else "—"
         reg_str    = r["created_at"].strftime("%d.%m.%Y %H:%M") if r.get("created_at") else "—"
-        row_data   = [i, r["user_id"], username, status, access_str, reg_str]
+        ref_cnt    = r.get("ref_count", 0) or 0
+        row_data   = [i, r["user_id"], username, status, access_str, reg_str, ref_cnt]
         fill = premium_fill if is_premium else (alt_fill if i % 2 == 0 else normal_fill)
         font = premium_font if is_premium else normal_font
         for col_idx, value in enumerate(row_data, start=1):
             cell = ws.cell(row=row_num, column=col_idx, value=value)
             cell.fill      = fill
             cell.font      = font
-            cell.alignment = center_align if col_idx in (1, 2, 4, 5) else left_align
+            cell.alignment = center_align if col_idx in (1, 2, 4, 5, 7) else left_align
         ws.row_dimensions[row_num].height = 18
     total_users = len(rows)
     premium_cnt = sum(1 for r in rows if r.get("access_until") and r["access_until"] > now)
@@ -830,12 +939,97 @@ def build_users_excel(rows: list) -> bytes:
     return buf.read()
 
 # ================================================================
-# ═════════════════  INFO BUTTON  ════════════════════════════════
+# ═════════════  INFO BUTTON  ════════════════════════════════════
 # ================================================================
 
 @dp.message(F.text == "ℹ️ Ma'lumot")
 async def info_handler(message: types.Message):
     await message.answer(BOT_INFO_TEXT, parse_mode="HTML")
+
+# ================================================================
+# ══════════════  REFERRAL — DO'ST TAKLIF QILISH  ════════════════
+# ================================================================
+
+@dp.message(F.text == "👥 Do'st taklif qilish")
+async def referral_panel(message: types.Message):
+    uid   = message.from_user.id
+    code  = get_or_create_ref_code(uid)
+    total = get_referral_count(uid)
+    done_milestones   = total // REFERRAL_REQUIRED
+    remaining_in_step = REFERRAL_REQUIRED - (total % REFERRAL_REQUIRED)
+
+    invite_link = f"https://t.me/{BOT_USERNAME}?start=ref_{code}"
+
+    # Progress bar (10 slots)
+    filled  = total % REFERRAL_REQUIRED
+    bar     = "🟩" * filled + "⬜" * (REFERRAL_REQUIRED - filled)
+
+    text = (
+        f"👥 <b>DO'ST TAKLIF QILISH</b>\n\n"
+        f"Har <b>{REFERRAL_REQUIRED} ta</b> do'stingizni taklif qilganingizda "
+        f"<b>{REFERRAL_REWARD_DAYS} kunlik premium</b> sovg'a!\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 Sizning statistikangiz:\n"
+        f"👤 Jami taklif qilinganlar: <b>{total}</b>\n"
+        f"🎁 Qo'lga kiritilgan mukofotlar: <b>{done_milestones}</b>\n"
+        f"⏳ Keyingi mukofotgacha: <b>{remaining_in_step}</b> ta\n\n"
+        f"{bar}  <b>{total % REFERRAL_REQUIRED}/{REFERRAL_REQUIRED}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🔗 Sizning havolangiz:\n"
+        f"<code>{invite_link}</code>\n\n"
+        f"👇 Pastdagi tugmani bosib do'stlaringizga yuboring!"
+    )
+
+    share_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="📤 Do'stlarga yuborish",
+            url=f"https://t.me/share/url?url={invite_link}&text=Bu%20botdan%20foydalaning%2C%20juda%20foydali%21"
+        )],
+        [InlineKeyboardButton(text="🔄 Yangilash", callback_data="ref:refresh")]
+    ])
+    await message.answer(text, parse_mode="HTML", reply_markup=share_kb)
+
+
+@dp.callback_query(F.data == "ref:refresh")
+async def referral_refresh(callback: types.CallbackQuery):
+    uid   = callback.from_user.id
+    code  = get_or_create_ref_code(uid)
+    total = get_referral_count(uid)
+    done_milestones   = total // REFERRAL_REQUIRED
+    remaining_in_step = REFERRAL_REQUIRED - (total % REFERRAL_REQUIRED)
+
+    invite_link = f"https://t.me/{BOT_USERNAME}?start=ref_{code}"
+    filled  = total % REFERRAL_REQUIRED
+    bar     = "🟩" * filled + "⬜" * (REFERRAL_REQUIRED - filled)
+
+    text = (
+        f"👥 <b>DO'ST TAKLIF QILISH</b>\n\n"
+        f"Har <b>{REFERRAL_REQUIRED} ta</b> do'stingizni taklif qilganingizda "
+        f"<b>{REFERRAL_REWARD_DAYS} kunlik premium</b> sovg'a!\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 Sizning statistikangiz:\n"
+        f"👤 Jami taklif qilinganlar: <b>{total}</b>\n"
+        f"🎁 Qo'lga kiritilgan mukofotlar: <b>{done_milestones}</b>\n"
+        f"⏳ Keyingi mukofotgacha: <b>{remaining_in_step}</b> ta\n\n"
+        f"{bar}  <b>{total % REFERRAL_REQUIRED}/{REFERRAL_REQUIRED}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🔗 Sizning havolangiz:\n"
+        f"<code>{invite_link}</code>\n\n"
+        f"👇 Pastdagi tugmani bosib do'stlaringizga yuboring!"
+    )
+
+    share_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="📤 Do'stlarga yuborish",
+            url=f"https://t.me/share/url?url={invite_link}&text=Bu%20botdan%20foydalaning%2C%20juda%20foydali%21"
+        )],
+        [InlineKeyboardButton(text="🔄 Yangilash", callback_data="ref:refresh")]
+    ])
+    await callback.answer("🔄 Yangilandi")
+    try:
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=share_kb)
+    except Exception:
+        await callback.message.answer(text, parse_mode="HTML", reply_markup=share_kb)
 
 # ================================================================
 # ══════════════  SUPPORT / YORDAM  ══════════════════════════════
@@ -844,10 +1038,7 @@ async def info_handler(message: types.Message):
 @dp.message(F.text == "🆘 Yordam")
 async def support_start(message: types.Message, state: FSMContext):
     await state.set_state(SupportStates.waiting_message)
-    await message.answer(
-        "✍️ Xabaringizni yozing:",
-        reply_markup=kb_cancel()
-    )
+    await message.answer("✍️ Xabaringizni yozing:", reply_markup=kb_cancel())
 
 @dp.message(SupportStates.waiting_message, F.text)
 async def support_receive(message: types.Message, state: FSMContext):
@@ -855,13 +1046,11 @@ async def support_receive(message: types.Message, state: FSMContext):
     username = message.from_user.username or "—"
     text     = message.text.strip()
     await state.clear()
-
     admin_txt = (
         f"💬 <b>YORDAM SO'ROVI</b>\n"
         f"👤 @{username} (ID: <code>{uid}</code>)\n"
         f"📅 {datetime.now().strftime('%d.%m.%Y %H:%M')}\n"
-        f"{'─'*25}\n\n"
-        f"{text}"
+        f"{'─'*25}\n\n{text}"
     )
     reply_kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="↩️ Javob berish", callback_data=f"supReply:{uid}")
@@ -870,11 +1059,7 @@ async def support_receive(message: types.Message, state: FSMContext):
         await bot.send_message(OWNER_ID, admin_txt, reply_markup=reply_kb, parse_mode="HTML")
     except Exception as e:
         print(f"[SUPPORT FORWARD ERROR] {e}")
-
-    await message.answer(
-        "✅ Xabaringiz adminga yuborildi!",
-        reply_markup=get_menu(uid)
-    )
+    await message.answer("✅ Xabaringiz adminga yuborildi!", reply_markup=get_menu(uid))
 
 @dp.callback_query(F.data.startswith("supReply:"))
 async def support_reply_start(callback: types.CallbackQuery, state: FSMContext):
@@ -886,8 +1071,7 @@ async def support_reply_start(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
     await callback.message.reply(
         f"✏️ <code>{target_uid}</code> foydalanuvchiga javobingizni yozing:",
-        reply_markup=kb_cancel(),
-        parse_mode="HTML"
+        reply_markup=kb_cancel(), parse_mode="HTML"
     )
 
 @dp.message(SupportReplyStates.waiting_reply, F.text)
@@ -896,11 +1080,7 @@ async def support_reply_send(message: types.Message, state: FSMContext):
     target_uid = data.get("support_target_uid")
     await state.clear()
     try:
-        await bot.send_message(
-            target_uid,
-            f"<b>Admin:</b>\n\n{message.text}",
-            parse_mode="HTML"
-        )
+        await bot.send_message(target_uid, f"<b>Admin:</b>\n\n{message.text}", parse_mode="HTML")
         await message.answer("✅ Javob yuborildi.", reply_markup=get_menu(message.from_user.id))
     except Exception as e:
         await message.answer(f"❌ Xato: {e}")
@@ -917,7 +1097,6 @@ async def subadmins_panel(event: types.Message | types.CallbackQuery):
         if isinstance(event, types.CallbackQuery):
             return await event.answer("❌ Faqat owner uchun", show_alert=True)
         return
-
     admins = all_sub_admins()
     text = (
         f"🛡 <b>SUB-ADMINLAR</b>\n\nJami: <b>{len(admins)}</b> ta sub-admin\n\n"
@@ -988,7 +1167,6 @@ async def subadm_got_uid(message: types.Message, state: FSMContext):
     target_uid = int(text)
     if target_uid == OWNER_ID:
         return await message.answer("❌ O'zingizni sub-admin qila olmaysiz.")
-
     existing = get_sub_admin(target_uid)
     current_perms = []
     if existing:
@@ -996,7 +1174,6 @@ async def subadm_got_uid(message: types.Message, state: FSMContext):
             current_perms = json.loads(existing["perms"])
         except Exception:
             current_perms = []
-
     username = None
     try:
         db = get_db()
@@ -1010,7 +1187,6 @@ async def subadm_got_uid(message: types.Message, state: FSMContext):
             db.close()
     except Exception:
         pass
-
     await state.set_state(SubAdminStates.choosing_perms)
     await state.update_data(target_uid=target_uid, current_perms=current_perms, target_username=username)
     uname_str = f"@{username}" if username else f"ID:{target_uid}"
@@ -1067,7 +1243,6 @@ async def perm_save(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer("❌ DB xato", show_alert=True)
         await state.clear()
         return
-
     await state.clear()
     uname_str = f"@{target_username}" if target_username else f"ID:{target_uid}"
     perm_txt  = ", ".join(PERM_LABELS.get(p, p) for p in current_perms) or "Hech biri"
@@ -1082,7 +1257,6 @@ async def perm_save(callback: types.CallbackQuery, state: FSMContext):
         )
     except Exception:
         await callback.message.answer(f"✅ Sub-admin saqlandi: {uname_str}\nRuxsatlar: {perm_txt}", parse_mode="HTML")
-
     try:
         perm_list = "\n".join(f"  • {PERM_LABELS.get(p,p)}" for p in current_perms) or "  • Hech biri"
         await bot.send_message(
@@ -1151,7 +1325,6 @@ async def subadm_delete(callback: types.CallbackQuery):
     except Exception as e:
         print(f"[SUBADM DELETE ERROR] {e}")
         return await callback.answer("❌ DB xato", show_alert=True)
-
     uname_str = f"@{row['username']}" if row.get("username") else f"ID:{target_uid}"
     await callback.answer(f"✅ {uname_str} o'chirildi")
     try:
@@ -1184,32 +1357,34 @@ async def listusers_cmd(event: types.Message | types.CallbackQuery):
         if isinstance(event, types.CallbackQuery):
             return await event.answer("❌ Ruxsat yo'q", show_alert=True)
         return
-
     if isinstance(event, types.CallbackQuery):
         await event.answer()
         target = event.message
     else:
         target = event
-
     try:
         db = get_db()
         try:
             with db.cursor() as c:
-                c.execute("SELECT user_id, username, access_until, created_at FROM users ORDER BY created_at DESC")
+                c.execute(
+                    """SELECT u.user_id, u.username, u.access_until, u.created_at,
+                              COUNT(r.id) AS ref_count
+                       FROM users u
+                       LEFT JOIN referrals r ON r.referrer_id = u.user_id
+                       GROUP BY u.user_id
+                       ORDER BY u.created_at DESC"""
+                )
                 rows = c.fetchall()
         finally:
             db.close()
     except Exception as e:
         print(f"[LISTUSERS DB ERROR] {e}")
         return await target.answer("❌ DB xato.")
-
     if not rows:
         return await target.answer("❌ Hech qanday foydalanuvchi yo'q.")
-
     now         = datetime.now()
     total       = len(rows)
     premium_cnt = sum(1 for r in rows if r.get("access_until") and r["access_until"] > now)
-
     await target.answer(
         f"👥 <b>FOYDALANUVCHILAR RO'YXATI</b>\n\n"
         f"📊 Jami: <b>{total}</b> | ✅ Premium: <b>{premium_cnt}</b> | 👤 Oddiy: <b>{total-premium_cnt}</b>\n\n"
@@ -1237,31 +1412,67 @@ async def listusers_cmd(event: types.Message | types.CallbackQuery):
 async def start(message: types.Message, state: FSMContext):
     uid      = message.from_user.id
     username = message.from_user.username or ""
+
+    # ── Parse referral code from deep link (/start ref_XXXXXXXX) ──
+    args = message.text.split(maxsplit=1)
+    ref_code_used = None
+    if len(args) > 1 and args[1].startswith("ref_"):
+        ref_code_used = args[1][4:]  # strip "ref_" prefix
+
+    # ── Register user ───────────────────────────────────────────
+    is_new = False
     try:
         db = get_db()
         try:
             with db.cursor() as c:
                 c.execute("SELECT user_id FROM users WHERE user_id=%s", (uid,))
                 existing = c.fetchone()
+                if not existing:
+                    is_new = True
                 c.execute(
                     "INSERT IGNORE INTO users (user_id, username, created_at) VALUES (%s,%s,%s)",
                     (uid, username, datetime.now())
                 )
-            if not existing:
-                try:
-                    await bot.send_message(
-                        OWNER_ID,
-                        f"🆕 <b>YANGI FOYDALANUVCHI</b>\n"
-                        f"👤 @{username or '—'} (ID: <code>{uid}</code>)\n"
-                        f"📅 {datetime.now().strftime('%d.%m.%Y %H:%M')}",
-                        parse_mode="HTML"
-                    )
-                except Exception as e:
-                    print(f"[NEW USER NOTIFY ERROR] {e}")
         finally:
             db.close()
     except Exception as e:
         print(f"[START DB ERROR] {e}")
+
+    # ── Notify owner of new user ─────────────────────────────────
+    if is_new:
+        try:
+            await bot.send_message(
+                OWNER_ID,
+                f"🆕 <b>YANGI FOYDALANUVCHI</b>\n"
+                f"👤 @{username or '—'} (ID: <code>{uid}</code>)\n"
+                f"📅 {datetime.now().strftime('%d.%m.%Y %H:%M')}",
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            print(f"[NEW USER NOTIFY ERROR] {e}")
+
+    # ── Record referral (only for truly new users) ───────────────
+    if is_new and ref_code_used:
+        referrer_id = get_uid_by_ref_code(ref_code_used)
+        if referrer_id and referrer_id != uid:
+            recorded = record_referral(referrer_id, uid)
+            if recorded:
+                # Tell the referrer someone joined via their link
+                total_now = get_referral_count(referrer_id)
+                remaining = REFERRAL_REQUIRED - (total_now % REFERRAL_REQUIRED)
+                try:
+                    await bot.send_message(
+                        referrer_id,
+                        f"🎉 <b>Yangi do'stingiz botga qo'shildi!</b>\n\n"
+                        f"👤 Jami taklif qilinganlar: <b>{total_now}</b>\n"
+                        f"⏳ Keyingi mukofotgacha: <b>{remaining}</b> ta",
+                        parse_mode="HTML"
+                    )
+                except Exception:
+                    pass
+                # Check and reward milestone
+                await check_and_reward_referrer(referrer_id)
+
     await state.clear()
     await message.answer("👋 Xush kelibsiz!", reply_markup=get_menu(uid))
 
@@ -1337,10 +1548,7 @@ async def pdf_clear_images(message: types.Message, state: FSMContext):
     for p in images:
         cleanup_files(p)
     await state.update_data(images=[])
-    await message.answer(
-        "🗑 Barcha rasmlar o'chirildi.\nQaytadan rasm yuborishingiz mumkin.",
-        reply_markup=menu_pdf_collecting(0, pdf_mode)
-    )
+    await message.answer("🗑 Barcha rasmlar o'chirildi.\nQaytadan rasm yuborishingiz mumkin.", reply_markup=menu_pdf_collecting(0, pdf_mode))
 
 
 @dp.message(PDFStates.collecting_images, F.text == "📥 PDF yaratish")
@@ -1360,17 +1568,13 @@ async def pdf_create(message: types.Message, state: FSMContext):
     images   = data.get("images", [])
     pdf_mode = data.get("pdf_mode", "simple")
     pdf_path = None
-
     if not images:
         await state.clear()
         return await message.answer("❌ Rasm topilmadi.", reply_markup=get_menu(message.from_user.id))
-
     safe_name = sanitize_filename(message.text)
     pdf_path  = f"/tmp/{safe_name}_{uuid.uuid4().hex}.pdf"
-
     mode_label = "🔬 Skan" if pdf_mode == "scan" else "📄 Oddiy"
     await message.answer(f"⏳ {mode_label} PDF yaratilmoqda...")
-
     try:
         pil_images = []
         for p in images:
@@ -1378,12 +1582,9 @@ async def pdf_create(message: types.Message, state: FSMContext):
             if pdf_mode == "scan":
                 img = process_scan_image(img)
             pil_images.append(img)
-
         build_pdf_with_reportlab(pil_images, pdf_path)
-
         for img in pil_images:
             img.close()
-
         await message.answer_document(
             FSInputFile(pdf_path, filename=f"{safe_name}.pdf"),
             caption=f"✅ {mode_label} PDF tayyor! ({len(images)} ta rasm)"
@@ -1393,7 +1594,6 @@ async def pdf_create(message: types.Message, state: FSMContext):
     finally:
         cleanup_files(*images, pdf_path)
         await state.clear()
-
     await message.answer("✅ Bajarildi!", reply_markup=get_menu(message.from_user.id))
 
 # ================================================================
@@ -1411,9 +1611,7 @@ async def payment_info(message: types.Message):
 async def wait_for_check(message: types.Message, state: FSMContext):
     uid = message.from_user.id
     if user_submitted_check_today(uid) and uid != OWNER_ID:
-        return await message.answer(
-            "⚠️ Siz bugungi limitdan foydalandingiz, ertaga qayta bosing."
-        )
+        return await message.answer("⚠️ Siz bugungi limitdan foydalandingiz, ertaga qayta bosing.")
     await state.set_state(PaymentStates.waiting_check)
     await message.answer("🧾 Chekni yuboring (rasm yoki PDF)")
 
@@ -1422,7 +1620,6 @@ async def wait_for_check(message: types.Message, state: FSMContext):
 async def receive_check(message: types.Message, state: FSMContext):
     uid = message.from_user.id
     await state.clear()
-
     try:
         db = get_db()
         try:
@@ -1437,7 +1634,6 @@ async def receive_check(message: types.Message, state: FSMContext):
     except Exception as e:
         print(f"[PAYMENT INSERT ERROR] {e}")
         return await message.answer("❌ Xato yuz berdi.")
-
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="✅ 30 kun",  callback_data=f"pApprove:{payment_id}:{uid}:30"),
@@ -1451,7 +1647,6 @@ async def receive_check(message: types.Message, state: FSMContext):
         f"🧾 <b>TO'LOV CHEKI</b>\n👤 @{username} (ID: <code>{uid}</code>)\n"
         f"🆔 Payment ID: {payment_id}\n📅 {datetime.now().strftime('%d.%m.%Y %H:%M')}"
     )
-
     targets = [OWNER_ID] + [a["user_id"] for a in all_sub_admins() if "payments" in json.loads(a.get("perms", "[]"))]
     for admin_target in targets:
         try:
@@ -1461,7 +1656,6 @@ async def receive_check(message: types.Message, state: FSMContext):
                 await bot.send_document(admin_target, message.document.file_id, caption=caption, reply_markup=kb, parse_mode="HTML")
         except Exception as e:
             print(f"[ADMIN SEND ERROR uid={admin_target}] {e}")
-
     await message.answer("⏳ Chek yuborildi. 24 soat ichida javob beriladi.")
 
 
@@ -1474,7 +1668,6 @@ async def approve_payment(callback: types.CallbackQuery):
         payment_id, uid, days = int(payment_id), int(uid), int(days)
     except Exception:
         return await callback.answer("❌ Noto'g'ri format", show_alert=True)
-
     try:
         db = get_db()
         try:
@@ -1500,7 +1693,6 @@ async def approve_payment(callback: types.CallbackQuery):
     except Exception as e:
         print(f"[APPROVE PAYMENT ERROR] {e}")
         return await callback.answer("❌ DB xato", show_alert=True)
-
     try:
         await bot.send_message(
             uid,
@@ -1509,7 +1701,6 @@ async def approve_payment(callback: types.CallbackQuery):
         )
     except Exception as e:
         print(f"[SEND ERROR uid={uid}] {e}")
-
     admin_name = callback.from_user.username or str(callback.from_user.id)
     try:
         await callback.message.edit_caption(
@@ -1533,7 +1724,6 @@ async def reject_payment(callback: types.CallbackQuery):
         payment_id, uid = int(payment_id), int(uid)
     except Exception:
         return await callback.answer("❌ Noto'g'ri format", show_alert=True)
-
     try:
         db = get_db()
         try:
@@ -1554,12 +1744,10 @@ async def reject_payment(callback: types.CallbackQuery):
     except Exception as e:
         print(f"[REJECT PAYMENT ERROR] {e}")
         return await callback.answer("❌ DB xato", show_alert=True)
-
     try:
         await bot.send_message(uid, "❌ To'lovingiz tasdiqlanmadi.\nChekni qayta tekshirib yuboring.")
     except Exception as e:
         print(f"[SEND ERROR uid={uid}] {e}")
-
     admin_name = callback.from_user.username or str(callback.from_user.id)
     try:
         await callback.message.edit_caption(
@@ -1585,13 +1773,11 @@ async def adm_pending_payments(event: types.Message | types.CallbackQuery):
         if isinstance(event, types.CallbackQuery):
             return await event.answer("❌ Ruxsat yo'q", show_alert=True)
         return
-
     if isinstance(event, types.CallbackQuery):
         await event.answer()
         target = event.message
     else:
         target = event
-
     try:
         db = get_db()
         try:
@@ -1607,14 +1793,9 @@ async def adm_pending_payments(event: types.Message | types.CallbackQuery):
     except Exception as e:
         print(f"[PENDING PAY ERROR] {e}")
         return await target.answer("❌ DB xato.")
-
     if not rows:
         return await target.answer("✅ Hozircha kutilayotgan to'lovlar yo'q.")
-
-    await target.answer(
-        f"⏳ <b>KUTILAYOTGAN TO'LOVLAR — {len(rows)} ta</b>",
-        parse_mode="HTML"
-    )
+    await target.answer(f"⏳ <b>KUTILAYOTGAN TO'LOVLAR — {len(rows)} ta</b>", parse_mode="HTML")
     for r in rows:
         uname    = f"@{r['username']}" if r.get("username") else "—"
         date_str = r["created_at"].strftime('%d.%m.%Y %H:%M') if r.get("created_at") else "—"
@@ -1764,7 +1945,6 @@ async def order_confirm(message: types.Message, state: FSMContext):
     deadline_str  = data["deadline"]
     deadline_date = deadline_str_to_date(deadline_str)
     filetype      = data.get("filetype", "📄 PDF")
-
     try:
         db = get_db()
         try:
@@ -1780,7 +1960,6 @@ async def order_confirm(message: types.Message, state: FSMContext):
     except Exception as e:
         print(f"[ORDER INSERT ERROR] {e}")
         return await message.answer("❌ Buyurtmani saqlashda xato.")
-
     await state.clear()
     type_name = ORDER_TYPES.get(data["order_type"], data["order_type"])
     await message.answer(
@@ -2095,17 +2274,9 @@ async def broadcast_send(callback: types.CallbackQuery, state: FSMContext):
     for i, uid in enumerate(user_ids, 1):
         try:
             if msg_type == "text" and original_txt:
-                await bot.send_message(
-                    chat_id=uid,
-                    text=f"<b>Admin:</b>\n\n{original_txt}",
-                    parse_mode="HTML"
-                )
+                await bot.send_message(chat_id=uid, text=f"<b>Admin:</b>\n\n{original_txt}", parse_mode="HTML")
             else:
-                await bot.copy_message(
-                    chat_id=uid,
-                    from_chat_id=data["from_chat_id"],
-                    message_id=data["message_id"]
-                )
+                await bot.copy_message(chat_id=uid, from_chat_id=data["from_chat_id"], message_id=data["message_id"])
             success += 1
         except Exception:
             failed += 1
@@ -2513,13 +2684,14 @@ async def access_watcher():
 # ================================================================
 
 async def on_startup():
-    ensure_admins_table()
+    ensure_tables()
     asyncio.create_task(access_watcher())
     print("✅ Bot ishga tushdi")
     if HAS_CV2:
         print("✅ OpenCV mavjud — auto-crop va professional skan yoqildi")
     else:
         print("⚠️  OpenCV yo'q — fallback skan rejimi ishlatiladi (pip install opencv-python-headless)")
+    print(f"👥 Referral tizimi: {REFERRAL_REQUIRED} ta taklif = {REFERRAL_REWARD_DAYS} kun premium")
 
 
 async def main():
