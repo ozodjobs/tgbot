@@ -1224,7 +1224,7 @@ async def payment_info(message: types.Message):
 async def wait_for_check(message: types.Message, state: FSMContext):
     uid = message.from_user.id
     # ─── NEW: 24-hour limit ──────────────────────────────────────
-    if user_submitted_check_today(uid):
+    if user_submitted_check_today(uid) and uid != OWNER_ID:
         return await message.answer(
             "⚠️ Siz bugungi limitdan foydalandingiz, ertaga qayta bosing."
         )
