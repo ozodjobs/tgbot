@@ -51,6 +51,15 @@ def ensure_tables():
                     c.execute("ALTER TABLE users ADD COLUMN ref_code VARCHAR(16) UNIQUE DEFAULT NULL")
                 except Exception:
                     pass  # Column already exists
+                # Add first_name and last_name columns (if not present)
+                try:
+                    c.execute("ALTER TABLE users ADD COLUMN first_name VARCHAR(255) DEFAULT NULL")
+                except Exception:
+                    pass  # Already exists
+                try:
+                    c.execute("ALTER TABLE users ADD COLUMN last_name VARCHAR(255) DEFAULT NULL")
+                except Exception:
+                    pass  # Already exists
         finally:
             db.close()
     except Exception as e:

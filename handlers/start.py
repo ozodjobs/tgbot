@@ -37,9 +37,13 @@ async def start(message: types.Message, state: FSMContext):
                 existing = c.fetchone()
                 if not existing:
                     is_new = True
+                first_name = message.from_user.first_name or ""
+                last_name  = message.from_user.last_name  or ""
                 c.execute(
-                    "INSERT IGNORE INTO users (user_id, username, created_at) VALUES (%s,%s,%s)",
-                    (uid, username, datetime.now())
+                    "INSERT INTO users (user_id, username, first_name, last_name, created_at) "
+                    "VALUES (%s, %s, %s, %s, %s) "
+                    "ON DUPLICATE KEY UPDATE username=VALUES(username), first_name=VALUES(first_name), last_name=VALUES(last_name)",
+                    (uid, username, first_name, last_name, datetime.now())
                 )
         finally:
             db.close()

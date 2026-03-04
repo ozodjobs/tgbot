@@ -333,6 +333,7 @@ async def broadcast_preview(message: types.Message, state: FSMContext):
 
 @router.callback_query(F.data == "bc:send")
 async def broadcast_send(callback: types.CallbackQuery, state: FSMContext):
+    from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
     if not has_perm(callback.from_user.id, "broadcast"):
         return await callback.answer("❌ Ruxsat yo'q", show_alert=True)
     data         = await state.get_data()
@@ -343,7 +344,7 @@ async def broadcast_send(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.answer("⏳ Yuborilmoqda...")
     status_msg = await callback.message.reply(f"⏳ Yuborilmoqda... 0/{len(user_ids)}")
-    success = failed = 0
+    success = failed = blocked = 0
     for i, uid in enumerate(user_ids, 1):
         try:
             if msg_type == "text" and original_txt:
@@ -351,17 +352,35 @@ async def broadcast_send(callback: types.CallbackQuery, state: FSMContext):
             else:
                 await callback.bot.copy_message(chat_id=uid, from_chat_id=data["from_chat_id"], message_id=data["message_id"])
             success += 1
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+            try:
+                if msg_type == "text" and original_txt:
+                    await callback.bot.send_message(chat_id=uid, text=f"<b>Admin:</b>\n\n{original_txt}", parse_mode="HTML")
+                else:
+                    await callback.bot.copy_message(chat_id=uid, from_chat_id=data["from_chat_id"], message_id=data["message_id"])
+                success += 1
+            except Exception:
+                failed += 1
+        except TelegramForbiddenError:
+            blocked += 1  # User botni block qilgan
         except Exception:
             failed += 1
         if i % 20 == 0:
             try:
-                await status_msg.edit_text(f"⏳ {i}/{len(user_ids)}\n✅ {success} | ❌ {failed}")
+                await status_msg.edit_text(
+                    f"⏳ {i}/{len(user_ids)}\n✅ {success} | ❌ {failed} | 🚫 {blocked}"
+                )
             except Exception:
                 pass
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.035)
     try:
         await status_msg.edit_text(
-            f"✅ <b>Broadcast yakunlandi!</b>\n\n👥 Jami: {len(user_ids)}\n✅ {success} | ❌ {failed}",
+            f"✅ <b>Broadcast yakunlandi!</b>\n\n"
+            f"👥 Jami: <b>{len(user_ids)}</b>\n"
+            f"✅ Yuborildi: <b>{success}</b>\n"
+            f"❌ Xato: <b>{failed}</b>\n"
+            f"🚫 Bloklagan: <b>{blocked}</b>",
             parse_mode="HTML"
         )
     except Exception:
@@ -485,7 +504,8 @@ async def listusers_cmd(event: types.Message | types.CallbackQuery):
         try:
             with db.cursor() as c:
                 c.execute(
-                    """SELECT u.user_id, u.username, u.access_until, u.created_at,
+                    """SELECT u.user_id, u.username, u.first_name, u.last_name,
+                              u.access_until, u.created_at,
                               COUNT(r.id) AS ref_count
                        FROM users u
                        LEFT JOIN referrals r ON r.referrer_id = u.user_id

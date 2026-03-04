@@ -178,8 +178,8 @@ def build_users_excel(rows: list) -> bytes:
     header_font  = Font(bold=True, color="FFFFFF", name="Arial", size=11)
     center_align = Alignment(horizontal="center", vertical="center")
     left_align   = Alignment(horizontal="left",   vertical="center")
-    headers    = ["#", "User ID", "Username", "Status", "Obuna tugashi", "Ro'yxatdan o'tgan", "Takliflar"]
-    col_widths = [5,   16,        24,          14,       18,              22,                   12]
+    headers    = ["#", "User ID", "Ism Familiya", "Username", "Status", "Obuna tugashi", "Ro'yxatdan o'tgan", "Takliflar"]
+    col_widths = [5,   16,        28,              20,          14,       18,              22,                   12]
     for col_idx, (header, width) in enumerate(zip(headers, col_widths), start=1):
         cell = ws.cell(row=1, column=col_idx, value=header)
         cell.font, cell.fill, cell.alignment = header_font, header_fill, center_align
@@ -194,19 +194,22 @@ def build_users_excel(rows: list) -> bytes:
     for i, r in enumerate(rows, start=1):
         row_num    = i + 1
         is_premium = bool(r.get("access_until") and r["access_until"] > now)
+        first_name = r.get("first_name") or ""
+        last_name  = r.get("last_name")  or ""
+        full_name  = f"{first_name} {last_name}".strip() or "—"
         username   = f"@{r['username']}" if r.get("username") else "—"
         status     = "✅ Premium" if is_premium else "👤 Oddiy"
         access_str = r["access_until"].strftime("%d.%m.%Y") if r.get("access_until") else "—"
         reg_str    = r["created_at"].strftime("%d.%m.%Y %H:%M") if r.get("created_at") else "—"
         ref_cnt    = r.get("ref_count", 0) or 0
-        row_data   = [i, r["user_id"], username, status, access_str, reg_str, ref_cnt]
+        row_data   = [i, r["user_id"], full_name, username, status, access_str, reg_str, ref_cnt]
         fill = premium_fill if is_premium else (alt_fill if i % 2 == 0 else normal_fill)
         font = premium_font if is_premium else normal_font
         for col_idx, value in enumerate(row_data, start=1):
             cell = ws.cell(row=row_num, column=col_idx, value=value)
             cell.fill      = fill
             cell.font      = font
-            cell.alignment = center_align if col_idx in (1, 2, 4, 5, 7) else left_align
+            cell.alignment = center_align if col_idx in (1, 2, 5, 6, 8) else left_align
         ws.row_dimensions[row_num].height = 18
     total_users = len(rows)
     premium_cnt = sum(1 for r in rows if r.get("access_until") and r["access_until"] > now)
