@@ -7,7 +7,7 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "YourBotUsername")  # Set this in .env!
 
-OWNER_ID = 6875167708
+OWNER_ID = 8750096932
 ADMIN_IDS = {OWNER_ID}
 
 PAYNET_LINK = "https://app.paynet.uz/?m=49156&i=1abfad1a-2da7-4d8d-8509-39f59b32d538"
